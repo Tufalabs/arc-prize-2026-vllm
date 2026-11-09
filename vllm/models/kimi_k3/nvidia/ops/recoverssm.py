@@ -227,6 +227,7 @@ def _kda_recoverssm_verify_kernel(
     {
         "HAS_REQUEST_INDICES": lambda args: args["request_indices_ptr"] is not None,
         "ALIGN_MODE": lambda args: args["block_table_ptr"] is not None,
+        "HAS_TAIL": lambda args: args["tail_boundaries_ptr"] is not None,
     }
 )
 @triton.jit
@@ -251,9 +252,14 @@ def _prepare_commit_plan_kernel(
     stride_block_table_row,
     stride_block_table_col,
     stride_num_computed,
+    tail_boundaries_ptr,
+    tail_blocks_ptr,
+    tail_state_indices_ptr,
+    tail_recovery_lens_ptr,
     SPEC_QUERY_LEN: tl.constexpr,
     HAS_REQUEST_INDICES: tl.constexpr,
     ALIGN_MODE: tl.constexpr,
+    HAS_TAIL: tl.constexpr,
 ):
     spec_idx = tl.program_id(0)
     source_state_idx = tl.load(state_indices_ptr + spec_idx * stride_state_indices).to(
@@ -278,13 +284,20 @@ def _prepare_commit_plan_kernel(
     final_state_idx = source_state_idx
     boundary_state_idx = null_block_id
     boundary_recovery_len = 0
+    tail_state_idx = null_block_id
+    tail_recovery_len = 0
     if ALIGN_MODE:
         num_computed = tl.load(num_computed_ptr + request_idx * stride_num_computed).to(
             tl.int32
         )
         final_num_computed = num_computed + commit_len
+        # The running state sits in the column of the last computed token,
+        # as align mode keeps it (the pre-copy's ceil(n / block) - 1): a
+        # window accepted up to a block's end stays in that block. The column
+        # after it is not allocated yet -- align mode allocates no lookahead
+        # -- and the manager frees only columns before this one.
         final_state_col = tl.minimum(
-            final_num_computed // mamba_block_size, block_table_width - 1
+            (final_num_computed - 1) // mamba_block_size, block_table_width - 1
         )
         final_state_idx = tl.load(
             block_table_ptr
@@ -301,6 +314,19 @@ def _prepare_commit_plan_kernel(
             mask=crosses_boundary,
             other=null_block_id,
         ).to(tl.int64)
+        if HAS_TAIL:
+            # A decode tail: the state at a unit boundary inside a block,
+            # written into the request's snapshot block when this window's
+            # accepted tokens cross it (KVCacheConfig.decode_tail_mode).
+            tail_boundary = tl.load(tail_boundaries_ptr + request_idx).to(tl.int32)
+            tail_block = tl.load(tail_blocks_ptr + request_idx).to(tl.int64)
+            crosses_tail = (
+                (tail_boundary > num_computed)
+                & (tail_boundary <= final_num_computed)
+                & (tail_block > null_block_id)
+            )
+            tail_state_idx = tl.where(crosses_tail, tail_block, null_block_id)
+            tail_recovery_len = tl.where(crosses_tail, tail_boundary - num_computed, 0)
     valid = (source_state_idx > null_block_id) & (commit_len > 0)
     tl.store(commit_lens_ptr + spec_idx, tl.where(valid, commit_len, 0))
     tl.store(
@@ -315,8 +341,20 @@ def _prepare_commit_plan_kernel(
         boundary_recovery_lens_ptr + spec_idx,
         tl.where(valid, boundary_recovery_len, 0),
     )
+    if HAS_TAIL:
+        tl.store(
+            tail_state_indices_ptr + spec_idx,
+            tl.where(valid, tail_state_idx, null_block_id),
+        )
+        tl.store(
+            tail_recovery_lens_ptr + spec_idx,
+            tl.where(valid, tail_recovery_len, 0),
+        )
 
 
+@triton.heuristics(
+    {"HAS_TAIL": lambda args: args["tail_state_indices_ptr"] is not None}
+)
 @triton.jit
 def _compact_conv_state_kernel(
     conv_state_ref_ptr,
@@ -333,9 +371,12 @@ def _compact_conv_state_kernel(
     conv_dim,
     conv_history_len,
     stride_state_indices,
+    tail_state_indices_ptr,
+    tail_recovery_lens_ptr,
     BLOCK_D: tl.constexpr,
     BLOCK_HISTORY: tl.constexpr,
     ALIGN_MODE: tl.constexpr,
+    HAS_TAIL: tl.constexpr,
 ):
     pid_d = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -374,6 +415,25 @@ def _compact_conv_state_kernel(
         mask=mask,
     )
     if ALIGN_MODE:
+        if HAS_TAIL:
+            # Before the boundary store below, which may land in the source
+            # block (a window accepted up to its block's end).
+            tail_state_idx = tl.load(tail_state_indices_ptr + pid_b).to(tl.int64)
+            tail_recovery_len = tl.load(tail_recovery_lens_ptr + pid_b)
+            tail_values = tl.load(
+                source_ptr
+                + offs_d[:, None] * dim_stride
+                + (tail_recovery_len - 1 + offs_h[None, :]) * token_stride,
+                mask=mask & (tail_state_idx > null_block_id),
+            )
+            tail_ptr = conv_state_ptr + tail_state_idx * block_stride
+            tl.store(
+                tail_ptr
+                + offs_d[:, None] * dim_stride
+                + offs_h[None, :] * token_stride,
+                tail_values,
+                mask=mask & (tail_state_idx > null_block_id),
+            )
         boundary_values = tl.load(
             source_ptr
             + offs_d[:, None] * dim_stride
@@ -985,6 +1045,10 @@ class KDARecoverSSMCommitContext:
             block_table_stride[0],
             block_table_stride[1],
             num_computed_stride,
+            None,
+            None,
+            None,
+            None,
             SPEC_QUERY_LEN=self.spec_query_len,
             num_warps=1,
         )
@@ -1003,6 +1067,8 @@ class KDARecoverSSMCommitContext:
             conv_dim,
             self.conv_history_len,
             state_indices.stride(0),
+            None,
+            None,
             BLOCK_D=256,
             BLOCK_HISTORY=block_history,
             ALIGN_MODE=block_table is not None,

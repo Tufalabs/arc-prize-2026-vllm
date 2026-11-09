@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -54,7 +56,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, is_transient_spec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
     PrefixCacheStats,
@@ -255,6 +257,7 @@ class Scheduler(SchedulerInterface):
         )
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
+        self.use_eagle_block_drop = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
         # Positions past the computed tokens that the drafter reads mid-prefill.
@@ -279,6 +282,13 @@ class Scheduler(SchedulerInterface):
                     if speculative_config.use_multi_module_mtp()
                     else 1
                 )
+            self.use_eagle_block_drop = speculative_config.use_eagle_block_drop()
+            if self.use_eagle and not self.use_eagle_block_drop:
+                logger.warning(
+                    "EAGLE trailing prefix-cache block dropping is disabled. "
+                    "This is experimental and may affect speculative-token "
+                    "acceptance rates."
+                )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -289,7 +299,7 @@ class Scheduler(SchedulerInterface):
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            use_eagle=self.use_eagle_block_drop,
             num_prefill_lookahead=self.num_prefill_lookahead,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
@@ -307,6 +317,14 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        # Balanced micro-batches (VLLM_PP_BALANCED_MICRO_BATCHES), which the
+        # async scheduler turns on with its decode cadence: the decodes each
+        # of the last pp_size - 1 steps scheduled, the micro-batches in flight
+        # beside the one being scheduled.
+        self.pp_balanced_micro_batches = False
+        self.pp_recent_num_decodes: deque[int] = deque(
+            maxlen=max(self.parallel_config.pipeline_parallel_size - 1, 1)
+        )
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
@@ -325,6 +343,23 @@ class Scheduler(SchedulerInterface):
         self._skip_zero_block_ids: set[int] = set()
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
+        )
+        # The Mamba groups' own block size. `cache_config.block_size` is the
+        # minimum over every group, which a smaller non-recurrent group (a
+        # sparse-attention ring) pulls below the recurrent block, and the
+        # split must align to the slot invariant of the recurrent groups.
+        mamba_block_sizes = {
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        }
+        assert len(mamba_block_sizes) <= 1, (
+            f"Mamba groups disagree on block size: {sorted(mamba_block_sizes)}"
+        )
+        self.mamba_block_size = (
+            mamba_block_sizes.pop()
+            if mamba_block_sizes
+            else self.cache_config.block_size
         )
         self.mamba_has_prefill_checkpoint_blocks = (
             self.has_mamba_layers
@@ -352,6 +387,11 @@ class Scheduler(SchedulerInterface):
         # FIFO of (fence_seq, blocks): blocks become safe to free once
         # processed_step_seq >= fence_seq.
         self.deferred_frees: deque[tuple[int, list[KVCacheBlock]]] = deque()
+        # VLLM_KV_BLOCKS_TRACE: who holds the pool, sampled about once a second.
+        self._kv_blocks_trace = None
+        self._kv_blocks_trace_last = 0.0
+        if envs.VLLM_KV_BLOCKS_TRACE:
+            self._kv_blocks_trace = open(envs.VLLM_KV_BLOCKS_TRACE, "a")  # noqa: SIM115
 
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -409,12 +449,12 @@ class Scheduler(SchedulerInterface):
         if start >= prefill_end:
             return num_new_tokens
 
-        block_size = self.cache_config.block_size
+        block_size = self.mamba_block_size
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle:
+        if self.use_eagle_block_drop:
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
@@ -460,6 +500,15 @@ class Scheduler(SchedulerInterface):
             start + (request.shared_prefix_boundary - start) // block_size * block_size
             if start < request.shared_prefix_boundary < end
             else 0,
+            # SamplingParams.zero_recurrent_state: the worker can only
+            # blank on a step that STANDS at the target, so a chunk that
+            # would stride across it is cut there. A request resuming from
+            # cache at the target needs nothing; one arriving cold does,
+            # and without this its blank is silently skipped.
+            request.sampling_params.zero_recurrent_at or 0
+            if request.sampling_params is not None
+            and getattr(request.sampling_params, "zero_recurrent_state", False)
+            else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
@@ -467,7 +516,7 @@ class Scheduler(SchedulerInterface):
 
     def _get_local_prefix_cache_hit(
         self, request: Request
-    ) -> tuple[KVCacheBlocks, int, int, bool]:
+    ) -> tuple[KVCacheBlocks, int, int, tuple[int, ...]]:
         connector = self.connector
         if connector is not None and connector.supports_divergent_local_hybrid_hits:
             return self.kv_cache_manager.get_computed_blocks_for_connector(request)
@@ -475,7 +524,7 @@ class Scheduler(SchedulerInterface):
         blocks, num_local, shared_prefix_boundary = (
             self.kv_cache_manager.get_computed_blocks(request)
         )
-        return blocks, num_local, shared_prefix_boundary, False
+        return blocks, num_local, shared_prefix_boundary, ()
 
     def _reserve_prefill_lookahead(
         self,
@@ -547,6 +596,25 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
+        # Micro-batch balance: a request decodes in the micro-batch of the step
+        # its prefill ended (next_decode_eligible_step), and nothing else evens
+        # them out. This step decodes at most an even share of its eligible
+        # decodes and those in flight; the rest wait a step, moving to the
+        # next micro-batch (a step's delay, once).
+        decode_quota = None
+        num_decodes = 0
+        if self.pp_balanced_micro_batches and self.pp_recent_num_decodes:
+            num_eligible = sum(
+                1
+                for r in self.running
+                if not r.is_prefill_chunk
+                and self.current_step >= r.next_decode_eligible_step
+            )
+            decode_quota = -(
+                -(num_eligible + sum(self.pp_recent_num_decodes))
+                // (len(self.pp_recent_num_decodes) + 1)
+            )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -575,6 +643,13 @@ class Scheduler(SchedulerInterface):
                 # to match worker-side sampled-tokens broadcast slot ring cadence.
                 req_index += 1
                 continue
+
+            if self.pp_balanced_micro_batches and not request.is_prefill_chunk:
+                if decode_quota is not None and num_decodes >= decode_quota:
+                    # Over this micro-batch's share: decode next step.
+                    req_index += 1
+                    continue
+                num_decodes += 1
 
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
@@ -775,8 +850,17 @@ class Scheduler(SchedulerInterface):
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                if input_budget <= draft_slots:
+            # With a KV connector the loop runs on a spent token budget too:
+            # a request whose hit loads asynchronously (an external hit, a
+            # divergent-hit fill) needs no budget this step, and below a
+            # step budget smaller than a recurrent block a running prefill
+            # spends the whole budget every step -- stopping at zero would
+            # leave every such request waiting, its host copy aging out.
+            # Requests that need compute are set aside below instead.
+            while (self.waiting or self.skipped_waiting) and (
+                token_budget > 0 or self.connector is not None
+            ):
+                if input_budget <= draft_slots and self.connector is None:
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
@@ -831,6 +915,7 @@ class Scheduler(SchedulerInterface):
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
+                fill_group_ids: tuple[int, ...] = ()
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
 
@@ -843,6 +928,28 @@ class Scheduler(SchedulerInterface):
                         request.shared_prefix_boundary,
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
+
+                    # SamplingParams.zero_recurrent_state. A request that
+                    # already resumes PAST the blank target is left alone:
+                    # recurrent state beyond the target, on a prefix that
+                    # reaches past a shared system prompt, can only have
+                    # been written by an earlier request of this same
+                    # conversation -- which was itself blanked at this
+                    # target. The state already carries the blank, so it is
+                    # inherited rather than blanked again.
+                    #
+                    # This is what lets a caller simply ask on every call
+                    # and leave the decision here, where the cache is
+                    # visible. The schedule is then self-correcting: a
+                    # response too short to carry the sequence across the
+                    # next recurrent block boundary writes nothing back, so
+                    # the next call resumes at or before the target and the
+                    # blank is applied then.
+                    #
+                    # Capping the hit at the target here instead would apply
+                    # the blank on every call -- compounding it on a
+                    # conversation whose state already carries it -- and
+                    # discard the cache past the target each time.
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -892,12 +999,46 @@ class Scheduler(SchedulerInterface):
                         if hit_diverged and num_external_computed_tokens == 0:
                             # No external tokens back the deeper local hit, so its
                             # resume boundary would have no valid Mamba state.
-                            # Reconcile to the boundary every group agrees on.
-                            (
-                                new_computed_blocks,
-                                num_new_local_computed_tokens,
-                                request.shared_prefix_boundary,
-                            ) = self.kv_cache_manager.get_computed_blocks(request)
+                            # A connector holding the lagging groups' state at
+                            # that boundary fills it: keep the deeper hit, drop
+                            # those groups' shallower local blocks, and wait for
+                            # the load as for an async external hit. Otherwise
+                            # reconcile to the boundary every group agrees on.
+                            # A transient group (a per-request ring the core
+                            # never prefix-caches) has no hit anywhere and none
+                            # to fill: no restore carries it either.
+                            groups = self.kv_cache_config.kv_cache_groups
+                            lagging = tuple(
+                                group_id
+                                for group_id, hit in enumerate(hit_diverged)
+                                if hit < block_aligned_local
+                                and not is_transient_spec(
+                                    groups[group_id].kv_cache_spec
+                                )
+                            )
+                            if lagging and self.connector.fill_divergent_hit(
+                                request, block_aligned_local, lagging
+                            ):
+                                fill_group_ids = lagging
+                                if partial_tail:
+                                    new_computed_blocks = (
+                                        self.kv_cache_manager.truncate_computed_blocks(
+                                            new_computed_blocks, block_aligned_local
+                                        )
+                                    )
+                                    num_new_local_computed_tokens = block_aligned_local
+                                new_computed_blocks = (
+                                    self.kv_cache_manager.drop_computed_groups(
+                                        new_computed_blocks, fill_group_ids
+                                    )
+                                )
+                                load_kv_async = True
+                            else:
+                                (
+                                    new_computed_blocks,
+                                    num_new_local_computed_tokens,
+                                    request.shared_prefix_boundary,
+                                ) = self.kv_cache_manager.get_computed_blocks(request)
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
@@ -944,8 +1085,15 @@ class Scheduler(SchedulerInterface):
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
-                    assert num_external_computed_tokens > 0
+                    assert num_external_computed_tokens > 0 or fill_group_ids
                     num_new_tokens = 0
+                elif token_budget <= 0 or input_budget <= draft_slots:
+                    # A budget is spent and this request needs compute: set it
+                    # aside for the step, as a chunk that cannot fit is, so the
+                    # loop reaches requests behind it whose loads need none.
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
@@ -1007,7 +1155,17 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
-                            break
+                            # The step's remaining budget is under a block, so this
+                            # request cannot start its aligned chunk now. Set it
+                            # aside for the step instead of stopping admission: a
+                            # request behind it whose hit is loaded asynchronously
+                            # (an external hit, a divergent-hit fill) needs no
+                            # budget and would otherwise wait out the whole prefill
+                            # in front of it. Re-queued ahead of everything else,
+                            # it is first in line for the next chunk that fits.
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
                         if (
                             pad_spec_decode
                             and num_new_tokens != 1 + self.num_spec_tokens
@@ -1070,9 +1228,25 @@ class Scheduler(SchedulerInterface):
                 if load_kv_async:
                     # An async load holds its blocks for the whole transfer with
                     # no forward progress and isn't preemptible here. Admit it
-                    # only if it fits in (free - other in-flight reservations), to
-                    # avoid deadlock and predictable preemptions.
-                    reserved_blocks = self._inflight_prefill_reserved_blocks()
+                    # only if it fits in (free - other in-flight reservations)
+                    # plus its own spec decode step blocks, to avoid deadlock and
+                    # predictable preemptions.
+                    num_local_computed_tokens = (
+                        request.num_computed_tokens + num_new_local_computed_tokens
+                    )
+                    reserved_blocks = (
+                        self._inflight_prefill_reserved_blocks()
+                        + self._spec_decode_step_blocks(
+                            request,
+                            new_computed_blocks,
+                            min(
+                                num_local_computed_tokens
+                                + num_external_computed_tokens,
+                                self.max_model_len,
+                            ),
+                            num_local_computed_tokens,
+                        )
+                    )
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -1086,6 +1260,7 @@ class Scheduler(SchedulerInterface):
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
+                    fill_group_ids=fill_group_ids,
                 )
 
                 if new_blocks is None:
@@ -1154,6 +1329,14 @@ class Scheduler(SchedulerInterface):
                                 num_computed_tokens,
                             )
                         )
+                        if fill_group_ids:
+                            # The filled boundary blocks sit inside the local
+                            # range, so the range above misses them.
+                            self._skip_zero_block_ids.update(
+                                self.kv_cache_manager.get_fill_block_ids(
+                                    request.request_id, fill_group_ids
+                                )
+                            )
                     continue
 
                 self.running.append(request)
@@ -1315,6 +1498,7 @@ class Scheduler(SchedulerInterface):
             # have run.
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
+        decode_tail_targets = self.kv_cache_manager.take_decode_tail_targets() or None
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
@@ -1351,6 +1535,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
+            decode_tail_targets=decode_tail_targets,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
@@ -1381,7 +1566,69 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if self.pp_balanced_micro_batches:
+            self.pp_recent_num_decodes.append(num_decodes)
+        if self._kv_blocks_trace is not None:
+            self._record_kv_blocks()
         return scheduler_output
+
+    def _record_kv_blocks(self) -> None:
+        """One VLLM_KV_BLOCKS_TRACE line, at most once a second: the pool's
+        free blocks, the blocks waiting on a deferred free, and per request
+        holding blocks its status, computed and total tokens, and its real and
+        null blocks in each KV cache group."""
+        trace = self._kv_blocks_trace
+        assert trace is not None
+        now = time.monotonic()
+        if now - self._kv_blocks_trace_last < 1.0:
+            return
+        first = self._kv_blocks_trace_last == 0.0
+        self._kv_blocks_trace_last = now
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        pool = self.kv_cache_manager.block_pool
+        held: dict[str, list[list[int]]] = {}
+        distinct: list[int] = []
+        for g, manager in enumerate(managers):
+            ids: set[int] = set()
+            for request_id, blocks in manager.req_to_blocks.items():
+                entry = held.setdefault(
+                    request_id, [[0] * len(managers), [0] * len(managers)]
+                )
+                for block in blocks:
+                    if block.is_null:
+                        entry[1][g] += 1
+                    else:
+                        entry[0][g] += 1
+                        ids.add(block.block_id)
+            distinct.append(len(ids))
+        reqs = []
+        for request_id, (real, null) in held.items():
+            request = self.requests.get(request_id)
+            reqs.append(
+                [
+                    request_id,
+                    request.status.name if request is not None else "GONE",
+                    request.num_computed_tokens if request is not None else -1,
+                    request.num_tokens if request is not None else -1,
+                    real,
+                    null,
+                ]
+            )
+        record: dict[str, Any] = {
+            "t": now,
+            "free": pool.get_num_free_blocks(),
+            "total": pool.num_gpu_blocks,
+            "deferred": sum(len(blocks) for _, blocks in self.deferred_frees),
+            "running": len(self.running),
+            "waiting": len(self.waiting),
+            "skipped": len(self.skipped_waiting),
+            "distinct": distinct,
+            "reqs": reqs,
+        }
+        if first:
+            record["groups"] = [type(m).__name__ for m in managers]
+        trace.write(json.dumps(record) + "\n")
+        trace.flush()
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
@@ -2601,6 +2848,11 @@ class Scheduler(SchedulerInterface):
             )
         )
 
+    def close_prefix_cache_context(self, prefix: str) -> int:
+        """End a client context's thread, or every context under ``prefix``
+        (``CacheConfig.prefix_cache_context_threads``)."""
+        return self.kv_cache_manager.close_prefix_cache_context(prefix)
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -2793,17 +3045,84 @@ class Scheduler(SchedulerInterface):
         return self.connector.request_finished_all_groups(request, block_ids)
 
     def _request_remaining_blocks(self, request: Request) -> int:
-        """Blocks `request` still needs to allocate to hold its full sequence."""
-        full_num_tokens = min(request.num_tokens, self.max_model_len)
+        """Blocks `request` still needs to hold its full sequence and be promoted."""
+        args = (
+            request,
+            self.kv_cache_manager.empty_kv_cache_blocks,
+            request.num_computed_tokens,
+            request.num_computed_tokens,
+        )
+        num_blocks = self._num_blocks_to_hold(
+            *args, spec_decode_step=False, apply_admission_cap=True
+        )
+        return num_blocks + self._spec_decode_step_blocks(*args)
+
+    def _spec_decode_step_blocks(
+        self,
+        request: Request,
+        new_computed_blocks: KVCacheBlocks,
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+    ) -> int:
+        """Number of blocks for the extra KV slots a spec decode step needs.
+
+        When using async kv load, scheduler must reserve enough blocks for
+        full sequence + the spec decode step, otherwise request cannot be
+        able to run after the async_load if we are out of kv blocks. Each KV
+        cache group takes the step in blocks of its own size, so the count
+        is the coordinator's, over all of them, and the one promotion's
+        allocation makes: a window past its admission cap still allocates
+        the step's blocks before it recycles any.
+        """
+        if not self.num_spec_tokens:
+            return 0
+        args = (
+            request,
+            new_computed_blocks,
+            total_computed_tokens,
+            num_local_computed_tokens,
+        )
+        with_step = self._num_blocks_to_hold(
+            *args, spec_decode_step=True, apply_admission_cap=False
+        )
+        without_step = self._num_blocks_to_hold(
+            *args, spec_decode_step=False, apply_admission_cap=False
+        )
+        return max(with_step - without_step, 0)
+
+    def _num_blocks_to_hold(
+        self,
+        request: Request,
+        new_computed_blocks: KVCacheBlocks,
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        spec_decode_step: bool,
+        apply_admission_cap: bool,
+    ) -> int:
+        """Blocks `request` must still allocate, across all KV cache groups, to
+        hold its full sequence and, with `spec_decode_step`, the spec decode
+        step it is promoted into: `1 + num_spec_tokens` target slots past the
+        sequence, and the lookahead on top. With `apply_admission_cap` the
+        count is the recycling-aware one admission reserves; without it, the
+        one an allocation makes. Either way it records nothing."""
+        num_tokens = num_tokens_main_model = min(request.num_tokens, self.max_model_len)
+        if spec_decode_step and self.num_spec_tokens:
+            num_tokens_main_model = min(
+                num_tokens + 1 + self.num_spec_tokens, self.max_model_len
+            )
+            num_tokens = min(
+                num_tokens_main_model + self.num_lookahead_tokens, self.max_model_len
+            )
         return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
-            num_tokens=full_num_tokens,
-            new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
+            num_tokens=num_tokens,
+            new_computed_blocks=new_computed_blocks.blocks,
             num_encoder_tokens=0,
-            total_computed_tokens=request.num_computed_tokens,
-            num_local_computed_tokens=request.num_computed_tokens,
-            num_tokens_main_model=full_num_tokens,
-            apply_admission_cap=True,
+            total_computed_tokens=total_computed_tokens,
+            num_local_computed_tokens=num_local_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+            apply_admission_cap=apply_admission_cap,
+            read_only=True,
         )
 
     def _inflight_prefill_reserved_blocks(self) -> int:

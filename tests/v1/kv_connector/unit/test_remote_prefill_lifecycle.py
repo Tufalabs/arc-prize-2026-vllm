@@ -4,7 +4,14 @@ import copy
 from unittest.mock import patch
 
 import pytest
+import torch
 
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    SlidingWindowSpec,
+)
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     KVConnectorOutput,
@@ -740,3 +747,144 @@ def test_async_loads_both_admitted_when_pool_fits():
 
     for req in reqs:
         assert req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+
+def test_async_load_reserves_blocks_for_promotion_margin():
+    """An async load is not admitted unless the blocks its own promotion will
+    need are still free.
+
+    A parked load is allocated without lookahead slots, but promotion pads it
+    to ``1 + num_spec_tokens`` and asks for the lookahead margin on top. Without
+    reserving that margin, two loads can be admitted that together consume the
+    whole pool; the head then fails ``allocate_slots`` forever while the load
+    behind it is never reached, and with nothing running no block is ever freed.
+
+    req_a (4 blocks) and req_b (3 blocks) exactly fill the 7 usable blocks, so
+    req_b must be held back in WAITING holding no blocks, leaving req_a room to
+    be promoted and run.
+    """
+    vllm_config = create_vllm_config(num_speculative_tokens=3)
+    BLOCK_SIZE = vllm_config.cache_config.block_size
+    scheduler = create_scheduler(vllm_config, num_blocks=8)  # usable = 7
+
+    req_a = create_request(
+        request_id=1,
+        block_size=BLOCK_SIZE,
+        num_tokens=BLOCK_SIZE * 4,
+        do_remote_prefill=True,
+        max_tokens=1,
+    )
+    req_b = create_request(
+        request_id=2,
+        block_size=BLOCK_SIZE,
+        num_tokens=BLOCK_SIZE * 3,
+        do_remote_prefill=True,
+        max_tokens=1,
+    )
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+
+    # Both get a full external hit, so each would hold its whole prompt.
+    with patch.object(
+        scheduler.connector,
+        "get_num_new_matched_tokens",
+        side_effect=[(BLOCK_SIZE * 4, True), (BLOCK_SIZE * 3, True)],
+    ):
+        scheduler.schedule()
+
+    assert req_a.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert req_b.status == RequestStatus.WAITING
+    req_to_blocks = scheduler.kv_cache_manager.coordinator.single_type_managers[
+        0
+    ].req_to_blocks
+    assert req_b.request_id not in req_to_blocks
+
+    # req_a's load lands: it must be promotable and actually get scheduled.
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        create_model_runner_output([], finished_recving={req_a.request_id}),
+    )
+    scheduler_output = scheduler.schedule()
+    assert req_a.status == RequestStatus.RUNNING
+    assert scheduler_output.num_scheduled_tokens[req_a.request_id] > 0
+
+
+@pytest.mark.parametrize(
+    "blocks_a, blocks_b, num_blocks",
+    [(4, 3, 24), (32, 30, 113)],
+    ids=["below-window-caps", "past-window-caps"],
+)
+def test_async_load_promotion_margin_spans_kv_cache_groups(
+    blocks_a: int, blocks_b: int, num_blocks: int
+):
+    """The promotion margin is counted in every KV cache group's blocks.
+
+    Promotion needs the spec decode step's slots in each group. With three
+    groups (full attention and two sliding windows) and MTP's lookahead, a
+    margin counted in one group's blocks admits both loads, leaving 2 usable
+    blocks free, short of the 3 req_a's promotion needs, and with nothing
+    running none is ever freed. Past the windows' admission caps a capped
+    count of the step drops the windows' share the same way, though the
+    promotion still allocates it. req_b must be held back so req_a can be
+    promoted and run.
+    """
+    vllm_config = create_vllm_config(num_speculative_tokens=3)
+    BLOCK_SIZE = vllm_config.cache_config.block_size
+    attention = dict(
+        block_size=BLOCK_SIZE, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full"], FullAttentionSpec(**attention)),
+            KVCacheGroupSpec(
+                ["swa128"], SlidingWindowSpec(**attention, sliding_window=128)
+            ),
+            KVCacheGroupSpec(
+                ["swa256"], SlidingWindowSpec(**attention, sliding_window=256)
+            ),
+        ],
+    )
+    scheduler = create_scheduler(
+        vllm_config, num_blocks=num_blocks, kv_cache_config=kv_cache_config
+    )
+    # ngram drafts with no lookahead; an MTP drafter takes num_spec_tokens.
+    scheduler.num_lookahead_tokens = 3
+
+    req_a = create_request(
+        request_id=1,
+        block_size=BLOCK_SIZE,
+        num_tokens=BLOCK_SIZE * blocks_a,
+        do_remote_prefill=True,
+        max_tokens=1,
+    )
+    req_b = create_request(
+        request_id=2,
+        block_size=BLOCK_SIZE,
+        num_tokens=BLOCK_SIZE * blocks_b,
+        do_remote_prefill=True,
+        max_tokens=1,
+    )
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+
+    with patch.object(
+        scheduler.connector,
+        "get_num_new_matched_tokens",
+        side_effect=[(BLOCK_SIZE * blocks_a, True), (BLOCK_SIZE * blocks_b, True)],
+    ):
+        scheduler.schedule()
+
+    assert req_a.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert req_b.status == RequestStatus.WAITING
+    for manager in scheduler.kv_cache_manager.coordinator.single_type_managers:
+        assert not manager.req_to_blocks.get(req_b.request_id)
+
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        create_model_runner_output([], finished_recving={req_a.request_id}),
+    )
+    scheduler_output = scheduler.schedule()
+    assert req_a.status == RequestStatus.RUNNING
+    assert scheduler_output.num_scheduled_tokens[req_a.request_id] > 0

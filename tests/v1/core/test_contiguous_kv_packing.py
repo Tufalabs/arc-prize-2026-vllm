@@ -21,11 +21,14 @@ from vllm.v1.core.kv_cache_utils import (
     _get_kv_cache_bytes_per_block,
     _get_packed_kv_cache_groups,
     _pool_bytes_per_block,
+    _project_kv_cache_groups_to_worker,
     generate_scheduler_kv_cache_config,
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
+    get_max_concurrency_for_kv_cache_config,
     resolve_kv_cache_block_sizes,
 )
+from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -544,6 +547,189 @@ class TestDensePacking:
         for i, name in enumerate(specs):
             assert (views[name].to(torch.int32) == i + 1).all(), name
             assert views[name].shape[0] == config.num_blocks
+
+
+class TestTransientPool:
+    """``CacheConfig.transient_kv_pool``: the compressor rings take blocks of a
+    pool of their own, each as wide as the ring group's packing, instead of a
+    shared block apiece."""
+
+    MAX_NUM_SEQS = 3
+    NUM_RINGS = 4 * MAX_NUM_SEQS + 1
+
+    def _config(self, transient: bool):
+        config = _shared_layout_config()
+        config.cache_config.transient_kv_pool = transient
+        config.use_v2_model_runner = True
+        config.scheduler_config.max_num_seqs = self.MAX_NUM_SEQS
+        return config
+
+    def _kv_cache_config(self, transient: bool, num_blocks: int = 32):
+        config = self._config(transient)
+        groups = get_kv_cache_groups(config, _make_csa_linear_specs())
+        shared = _get_kv_cache_bytes_per_block(groups)
+        rings = (
+            self.NUM_RINGS * _get_kv_cache_bytes_per_block(groups, transient_pool=True)
+            if transient
+            else 0
+        )
+        return config, get_kv_cache_config_from_groups(
+            config, groups, available_memory=shared * num_blocks + rings
+        )
+
+    def test_rings_leave_the_shared_pool(self):
+        _, plain = self._kv_cache_config(transient=False)
+        config, pooled = self._kv_cache_config(transient=True)
+
+        rings = [g for g in pooled.kv_cache_groups if g.transient_pool]
+        assert [g.layer_names for g in rings] == [
+            [_compressor_state_name(i) for i in range(NUM_CACHE_TUPLES)]
+        ]
+        assert not any(g.transient_pool for g in plain.kv_cache_groups)
+        # The shared pool keeps its block count and bytes; the rings' memory
+        # comes out of what the KV cache had beside it.
+        assert pooled.num_blocks == plain.num_blocks == 32
+        assert pooled.num_transient_blocks == self.NUM_RINGS
+        ring_layers = set(rings[0].layer_names)
+        for tensor in pooled.kv_cache_tensors:
+            if set(tensor.layers) <= ring_layers:
+                assert tensor.num_blocks == self.NUM_RINGS
+                assert tensor.size == self.NUM_RINGS * tensor.block_stride
+            else:
+                assert tensor.num_blocks is None
+                assert tensor.block_stride == _get_kv_cache_bytes_per_block(
+                    pooled.kv_cache_groups
+                )
+        # A request no longer holds a shared block for its ring.
+        assert get_max_concurrency_for_kv_cache_config(
+            config, pooled
+        ) > get_max_concurrency_for_kv_cache_config(config, plain)
+
+    def test_ring_views_index_their_own_allocation(self):
+        _, pooled = self._kv_cache_config(transient=True)
+        views = allocate_kv_cache(
+            pooled, torch.device("cpu"), KVCacheLayout["BLNHC"], None
+        )
+        ring = views[_compressor_state_name(0)]
+        main = views[_main_kv_name(0)]
+        assert ring.shape[0] == self.NUM_RINGS
+        assert main.shape[0] == pooled.num_blocks
+        assert ring.untyped_storage().data_ptr() != main.untyped_storage().data_ptr()
+        # Every ring block is addressable, the last one included.
+        ring[self.NUM_RINGS - 1].fill_(1)
+
+    def test_rings_come_from_and_return_to_their_own_pool(self):
+        _, pooled = self._kv_cache_config(transient=True)
+        scheduler_config = generate_scheduler_kv_cache_config([pooled])
+        manager = KVCacheManager(
+            scheduler_config,
+            max_model_len=8192,
+            enable_caching=False,
+            hash_block_size=16,
+            scheduler_block_size=16,
+        )
+        ring_manager = next(
+            m
+            for m in manager.coordinator.single_type_managers
+            if isinstance(m, CircularBufferManager)
+        )
+        shared_free = manager.block_pool.get_num_free_blocks()
+
+        def claim(request_id: str) -> int:
+            assert (
+                ring_manager.get_num_blocks_to_allocate(request_id, 1, [], 0, 0, 1) == 0
+            )
+            (ring,) = ring_manager.allocate_new_blocks(request_id, 1, 1)
+            return ring.block_id
+
+        ids = [claim(f"r{i}") for i in range(self.NUM_RINGS - 1)]
+        assert sorted(ids) == list(range(1, self.NUM_RINGS))
+        assert manager.block_pool.get_num_free_blocks() == shared_free
+        assert ring_manager.new_block_ids == []
+        # None left: the next request waits, as for KV capacity.
+        assert (
+            ring_manager.get_num_blocks_to_allocate("late", 1, [], 0, 0, 1)
+            > manager.block_pool.get_num_free_blocks()
+        )
+        # Freed rings go back to the pool, not to the shared one.
+        assert ring_manager.pop_blocks_for_free("r0") == []
+        assert manager.block_pool.get_num_free_blocks() == shared_free
+        assert claim("late") == ids[0]
+
+    def test_ring_groups_share_one_pool_without_sharing_a_ring(self):
+        """Rings beside more than one attention tuple's worth split into
+        several transient groups; their tensors overlay one allocation, so a
+        request's ring in each group must be a different block of it."""
+        specs = _make_csa_linear_specs()
+        for layer_index in range(NUM_CACHE_TUPLES, 3 * NUM_CACHE_TUPLES):
+            specs[_compressor_state_name(layer_index)] = CircularBufferSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=8,
+                head_size_v=0,
+                dtype=torch.bfloat16,
+            )
+        config = self._config(transient=True)
+        groups = get_kv_cache_groups(config, specs)
+        assert sum(group.transient_pool for group in groups) == 3
+        num_rings = 3 * (self.NUM_RINGS - 1) + 1
+        pooled = get_kv_cache_config_from_groups(
+            config,
+            groups,
+            available_memory=_get_kv_cache_bytes_per_block(groups) * 32
+            + num_rings * _get_kv_cache_bytes_per_block(groups, transient_pool=True),
+        )
+        assert pooled.num_transient_blocks == num_rings
+        manager = KVCacheManager(
+            generate_scheduler_kv_cache_config([pooled]),
+            max_model_len=8192,
+            enable_caching=False,
+            hash_block_size=16,
+            scheduler_block_size=16,
+        )
+        claimed = [
+            (m.kv_cache_group_id, m.allocate_new_blocks("r0", 1, 1)[0].block_id)
+            for m in manager.coordinator.single_type_managers
+            if isinstance(m, CircularBufferManager)
+        ]
+        assert len({block_id for _, block_id in claimed}) == len(claimed) == 3
+        views = allocate_kv_cache(
+            pooled, torch.device("cpu"), KVCacheLayout["BLNHC"], None
+        )
+        (first_group, first_id), (second_group, second_id) = claimed[:2]
+        first = views[pooled.kv_cache_groups[first_group].layer_names[0]]
+        second = views[pooled.kv_cache_groups[second_group].layer_names[0]]
+        first[first_id].fill_(1)
+        assert not second[second_id].any()
+
+    def test_a_stage_without_ring_layers_keeps_the_ring_count(self):
+        """A pipeline stage holding only GDN and PLE layers allocates no
+        rings, but its config keeps the pool's ring count: the scheduler is
+        built from one stage's config and hands the same ring IDs to all."""
+        config = self._config(transient=True)
+        specs = _make_csa_linear_specs()
+        stage = {
+            name: spec
+            for name, spec in specs.items()
+            if name.endswith((".linear_attn", ".ple"))
+        }
+        groups = _project_kv_cache_groups_to_worker(
+            get_kv_cache_groups(config, specs), stage
+        )
+        assert any(group.transient_pool and not group.layer_names for group in groups)
+        stage_config = get_kv_cache_config_from_groups(
+            config, groups, available_memory=_get_kv_cache_bytes_per_block(groups) * 32
+        )
+        assert stage_config.num_transient_blocks == self.NUM_RINGS
+        assert all(
+            tensor.num_blocks is None for tensor in stage_config.kv_cache_tensors
+        )
+
+    def test_needs_the_v2_model_runner(self):
+        config = self._config(transient=True)
+        config.use_v2_model_runner = False
+        with pytest.raises(ValueError, match="V2 model runner"):
+            get_kv_cache_groups(config, _make_csa_linear_specs())
 
 
 if __name__ == "__main__":

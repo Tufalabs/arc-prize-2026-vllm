@@ -313,6 +313,25 @@ def test_worker_kv_bytes_preserves_tensor_layout(packed: bool):
     assert offloading_config.cache.blocks_per_chunk == 2
 
 
+def test_worker_kv_bytes_take_the_largest_stage_block():
+    """The workers share one host region in equal per-worker slots, and the
+    scheduler sizes it from the first worker's config: under pipeline stages
+    of different blocks every side takes the largest, or the stages disagree
+    on the region's size and on where each worker's slot sits."""
+    config = _make_vllm_config(pipeline_parallel_size=2)
+    kv_cache_config = _make_sizing_kv_cache_config(packed=True)  # 16 bytes a block
+
+    kv_cache_config.max_worker_kv_bytes_per_block = 24
+    assert (
+        build_offloading_config(config, kv_cache_config).worker_kv_bytes_per_block == 24
+    )
+
+    kv_cache_config.max_worker_kv_bytes_per_block = 16
+    assert (
+        build_offloading_config(config, kv_cache_config).worker_kv_bytes_per_block == 16
+    )
+
+
 def test_zero_blocks_skips_tensor_layout_validation():
     kv_cache_config = _make_sizing_kv_cache_config(packed=False)
     kv_cache_config.num_blocks = 0

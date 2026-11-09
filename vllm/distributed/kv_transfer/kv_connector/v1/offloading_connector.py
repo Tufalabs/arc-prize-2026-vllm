@@ -141,6 +141,17 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             request, num_computed_tokens
         )
 
+    def fill_divergent_hit(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        lagging_group_ids: tuple[int, ...],
+    ) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.fill_divergent_hit(
+            request, num_computed_tokens, lagging_group_ids
+        )
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):

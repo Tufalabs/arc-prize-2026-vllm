@@ -48,6 +48,11 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
+    VLLM_BATCH_QUEUE_TRACE: str | None = None
+    VLLM_KV_BLOCKS_TRACE: str | None = None
+    VLLM_WORKER_RPC_TRACE: str | None = None
+    VLLM_TP_LOCAL_TOPK_LOGITS: bool = True
+    VLLM_PP_BALANCED_MICRO_BATCHES: bool = True
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -154,6 +159,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
+    VLLM_PLE_CPU_OFFLOAD: bool = False
+    VLLM_QWEN4EXP_PLE_SHARED_TABLE: str | None = None
+    VLLM_QWEN4EXP_PLE_SHARED_TABLE_HOLD_FROM: str | None = None
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -189,6 +197,9 @@ if TYPE_CHECKING:
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
+    VLLM_CUTEDSL_MOE_FP4_FORCE_A16: bool = False
+    VLLM_CUTEDSL_MOE_W4A16_FUSED_FINALIZE: bool = True
+    VLLM_SM100_KERNEL_SHAPES: bool = True
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -214,6 +225,7 @@ if TYPE_CHECKING:
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
+    VLLM_FLASHINFER_AUTOTUNE_CACHE_FILE: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
@@ -830,6 +842,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_LOGGING_CONFIG_PATH": lambda: os.getenv("VLLM_LOGGING_CONFIG_PATH"),
     # this is used for configuring the default logging level
     "VLLM_LOGGING_LEVEL": lambda: os.getenv("VLLM_LOGGING_LEVEL", "INFO").upper(),
+    # Sampling interval in seconds for vllm.utils.memory_log, which reports
+    # where host memory went; unset or non-positive disables it entirely.
+    "VLLM_MEMORY_LOG_S": lambda: os.getenv("VLLM_MEMORY_LOG_S", ""),
+    # Seconds to hold at each memory_log step marker, so a sample is
+    # guaranteed to land between two steps rather than straddling them.
+    "VLLM_MEMORY_LOG_PAUSE_S": lambda: os.getenv("VLLM_MEMORY_LOG_PAUSE_S", ""),
+    # Keep memory_log's per-worker sampler running through serving (device
+    # peaks reset at start-up's end) instead of stopping when start-up ends.
+    "VLLM_MEMORY_LOG_SERVING": lambda: os.getenv("VLLM_MEMORY_LOG_SERVING", ""),
+    # A per-process device memory ceiling in GiB, applied through the caching
+    # allocator when a worker takes its device, so a large card stands in for
+    # a smaller one (an L4's 22 GiB on a B200). It bounds what PyTorch may
+    # allocate, not what the driver, NCCL or kernel workspaces take; unset
+    # or empty leaves the card whole.
+    "VLLM_DEVICE_MEMORY_LIMIT_GIB": lambda: os.getenv(
+        "VLLM_DEVICE_MEMORY_LIMIT_GIB", ""
+    ),
     # this is used for configuring the default logging stream
     "VLLM_LOGGING_STREAM": lambda: os.getenv("VLLM_LOGGING_STREAM", "ext://sys.stdout"),
     # if set, VLLM_LOGGING_PREFIX will be prepended to all log messages
@@ -860,6 +889,38 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+    # A JSONL file the engine core appends a line to per batch-queue step (the
+    # queue's depth on entry, the batch it scheduled, the batch it waited on and
+    # for how long), to see how many batches a pipeline keeps in flight. Unset:
+    # nothing is recorded.
+    "VLLM_BATCH_QUEUE_TRACE": lambda: os.getenv("VLLM_BATCH_QUEUE_TRACE", None),
+    # A JSONL file the scheduler appends a line to about once a second: the
+    # pool's free blocks, the blocks waiting on a deferred free, and for every
+    # request holding blocks its status, tokens, and its real and null blocks
+    # in each KV cache group, with each group's distinct real blocks over all
+    # requests -- to see who holds the pool. Unset: nothing is recorded.
+    "VLLM_KV_BLOCKS_TRACE": lambda: os.getenv("VLLM_KV_BLOCKS_TRACE", None),
+    # A path prefix each multiproc worker appends a JSONL line to per RPC
+    # (<prefix>.rank<N>.jsonl: the method, when it was dequeued and when it
+    # finished, on the node's monotonic clock -- the engine core's
+    # VLLM_BATCH_QUEUE_TRACE uses the same). Unset: nothing is recorded.
+    "VLLM_WORKER_RPC_TRACE": lambda: os.getenv("VLLM_WORKER_RPC_TRACE", None),
+    # Under tensor parallelism, sample from each rank's own top-k logits,
+    # gathered, rather than all-gathering the vocabulary, on a step whose
+    # requests all sample from a top-k that nothing reorders first (no
+    # raising logit bias or allowed-token list, penalties, bad words,
+    # thinking budget, grammar or logprobs). 0: always the vocabulary
+    # all-gather.
+    "VLLM_TP_LOCAL_TOPK_LOGITS": lambda: bool(
+        int(os.getenv("VLLM_TP_LOCAL_TOPK_LOGITS", "1"))
+    ),
+    # Under pipeline stages (the V2 model runner, async scheduling), a step
+    # decodes at most an even share of its eligible decodes and those of the
+    # micro-batches in flight; the rest wait a step, moving to the next
+    # micro-batch. 0: every eligible decode in the step it falls on.
+    "VLLM_PP_BALANCED_MICRO_BATCHES": lambda: bool(
+        int(os.getenv("VLLM_PP_BALANCED_MICRO_BATCHES", "1"))
+    ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: (
@@ -1615,6 +1676,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FP4_FORCE_A16", "0"))
     ),
+    # Run the FlashInfer CuteDSL NvFP4 MoE with BF16 activations (W4A16):
+    # the experts' NvFP4 weights are decoded to BF16 in the kernel and no
+    # activation is quantized, as Marlin computes them.
+    "VLLM_CUTEDSL_MOE_FP4_FORCE_A16": lambda: bool(
+        int(os.getenv("VLLM_CUTEDSL_MOE_FP4_FORCE_A16", "0"))
+    ),
+    # Under W4A16, sum the experts' weighted outputs in the kernel's epilogue
+    # (FlashInfer's fused finalize: BF16 atomics, so the order varies run to
+    # run). 0 sums them in a separate reduction, in a fixed order.
+    "VLLM_CUTEDSL_MOE_W4A16_FUSED_FINALIZE": lambda: bool(
+        int(os.getenv("VLLM_CUTEDSL_MOE_W4A16_FUSED_FINALIZE", "1"))
+    ),
+    # The GDN RecoverSSM kernels' tiles a program and the INT4 QSA kernel's own
+    # decode configs on the 10.x family, read on a B200. 0 runs every card,
+    # the 10.x family included, at the shapes from before them.
+    "VLLM_SM100_KERNEL_SHAPES": lambda: bool(
+        int(os.getenv("VLLM_SM100_KERNEL_SHAPES", "1"))
+    ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))
@@ -1708,6 +1787,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Override the directory for the FlashInfer autotune config cache.
     "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.getenv(
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", None
+    ),
+    # The FlashInfer autotune config file itself, in place of one under the
+    # cache directory named by the config's hash: for a caller that keys the
+    # file by the settings the tuning depends on, where the hash also takes in
+    # state an engine fills in as it starts and no two engines would share it.
+    "VLLM_FLASHINFER_AUTOTUNE_CACHE_FILE": lambda: os.getenv(
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_FILE", None
     ),
     # Comma-separated FlashInfer op names to exclude from autotuning, using
     # the heuristic fallback tactic instead. Unset: skip "fp4_gemm" when the
@@ -2041,6 +2127,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_LOG_MODEL_INSPECTION": lambda: bool(
         int(os.getenv("VLLM_LOG_MODEL_INSPECTION", "0"))
     ),
+    # Keep Qwen4Exp PLE embedding tables in pinned CPU memory and gather their
+    # rows through UVA on a dedicated CUDA stream.
+    # Legacy fallback for EngramConfig.cpu_offload, which takes precedence.
+    # This environment variable may be removed in a future release.
+    "VLLM_PLE_CPU_OFFLOAD": lambda: bool(int(os.getenv("VLLM_PLE_CPU_OFFLOAD", "0"))),
+    # The host's shared Qwen4Exp PLE table: a file in /dev/shm every engine on
+    # the host maps in place of a pinned table of its own. Unset, each engine
+    # allocates its own. Read under ple_shared's name for it, a module its
+    # holder runs without vLLM.
+    "VLLM_QWEN4EXP_PLE_SHARED_TABLE": lambda: os.getenv(
+        "VLLM_QWEN4EXP_PLE_SHARED_TABLE", None
+    ),
+    # On the one engine of a host that holds the shared table: the checkpoint
+    # it builds the table from, in a holder process it starts in its own job.
+    "VLLM_QWEN4EXP_PLE_SHARED_TABLE_HOLD_FROM": lambda: os.getenv(
+        "VLLM_QWEN4EXP_PLE_SHARED_TABLE_HOLD_FROM", None
+    ),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))
@@ -2299,6 +2402,11 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_FILE",
+        # Where the shared PLE table and its checkpoint live: the table's
+        # rows are the checkpoint's either way.
+        "VLLM_QWEN4EXP_PLE_SHARED_TABLE",
+        "VLLM_QWEN4EXP_PLE_SHARED_TABLE_HOLD_FROM",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",

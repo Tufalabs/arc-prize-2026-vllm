@@ -482,6 +482,27 @@ class ResponsesRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def validate_zero_recurrent(cls, data):
+        """Refuse the blank on this surface rather than dropping it.
+
+        `/v1/responses` does not forward `zero_recurrent_state` to
+        `SamplingParams`, and `OpenAIBaseModel` allows unknown extras -- so
+        without this the keys would be accepted, logged as ignored, and the
+        request served unblanked while looking served. Rejecting is the
+        honest answer for a surface that cannot honour them; the chat and
+        completions endpoints carry them.
+        """
+        for name in ("zero_recurrent_state", "zero_recurrent_at"):
+            if data.get(name) is not None:
+                raise VLLMValidationError(
+                    f"{name} is not supported on /v1/responses; use the chat "
+                    "completions or completions endpoint.",
+                    parameter=name,
+                )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def validate_prompt(cls, data):
         if not isinstance(data, dict):
             return data

@@ -16,8 +16,10 @@ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.platform_utils import num_compute_units
 
-_TRITON_TABLE_CACHE: dict[tuple[torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
-_TRITON_BUFFER_CACHE: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
+_TRITON_TABLE_CACHE: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+_TRITON_BUFFER_CACHE: dict[
+    tuple[torch.device, torch.dtype, int] | tuple[torch.device, str], torch.Tensor
+] = {}
 
 # fmt: off
 _NORMAL_CDF_TO_SIGMA_TABLE = [
@@ -100,6 +102,35 @@ def _topk_topp_kernel(
     NORMAL_CDF_TO_SIGMA_TABLE,
     K,
     P,
+    # The fold (FOLD): the masked row is written to OUT, scaled by the row's
+    # temperature (TEMP[IDX_MAP[row]]) as _temperature_kernel would, and LOGITS
+    # may be bf16 and is left untouched; FUSE_STATS also writes each
+    # BLOCK_SIZE tile's argmax, max and sum of exp(x - max) of the written row
+    # to STATS_* [rows, tiles], what the rejection sampler's
+    # _compute_local_logits_stats_kernel computes for the target.
+    OUT,
+    OUT_STRIDE_0,
+    TEMP,
+    IDX_MAP,
+    STATS_ARGMAX,
+    STATS_MAX,
+    STATS_SUMEXP,
+    STATS_STRIDE_0,
+    # CAND (XKB_SPARSE_SAMPLER): instead of the masked row, the kept tokens'
+    # positions (ascending) and written values go to CAND_IDX/CAND_VAL
+    # [rows, CAND_MAX] and their count to CAND_CNT [rows]; a row keeping more
+    # than CAND_MAX tokens also gets its masked row written to OUT.
+    CAND_IDX,
+    CAND_VAL,
+    CAND_CNT,
+    CAND_STRIDE_0,
+    # CAND_FAST: pass 1 also records the outliers' positions in BUFFER_IDX
+    # [programs, IDX_CAP]; a top-k row whose pivot came from the outlier
+    # search (so every kept token is an outlier) and has at most IDX_CAP
+    # outliers emits its candidates from the buffer and skips the full final
+    # read and its stats; such a row keeping more than CAND_MAX tokens gets
+    # the masked row and stats written by the full read.
+    BUFFER_IDX,
     BATCH_SIZE,
     VOCAB_SIZE: tl.constexpr,
     MASK_VALUE: tl.constexpr,
@@ -107,13 +138,35 @@ def _topk_topp_kernel(
     BLOCK_SIZE_TRUNC: tl.constexpr,
     TOPK_ENABLED: tl.constexpr,
     TOPP_ENABLED: tl.constexpr,
+    FOLD: tl.constexpr,
+    FUSE_STATS: tl.constexpr,
+    CAND: tl.constexpr = False,
+    CAND_MAX: tl.constexpr = 256,
+    CAND_FAST: tl.constexpr = False,
+    IDX_CAP: tl.constexpr = 32768,
 ):
     NUM_TILES: tl.constexpr = (VOCAB_SIZE + BLOCK_SIZE - 1) // BLOCK_SIZE
     pid = tl.program_id(0)
     num_programs = tl.num_programs(0)
     for row_id in tl.range(pid, BATCH_SIZE, num_programs):
+        # The program's scratch row (BUFFER_ROW, BUFFER_IDX_ROW) passes between
+        # warps: a gather stores at cumsum positions that other warps' tiles
+        # then read. Every handoff has a barrier, this one against the
+        # previous row's reads; the conditions around each are per-row
+        # scalars, so every warp reaches it.
+        tl.debug_barrier()
         LOGITS_ROW = LOGITS + row_id.to(tl.int64) * LOGITS_STRIDE_0
         BUFFER_ROW = BUFFER + pid * VOCAB_SIZE
+        BUFFER_IDX_ROW = BUFFER_IDX + pid * IDX_CAP
+        used_outliers = tl.zeros((), dtype=tl.int32)
+        outlier_pivot = float("inf")
+        num_outliers = tl.zeros((), dtype=tl.uint32)
+        if FOLD:
+            OUT_ROW = OUT + row_id.to(tl.int64) * OUT_STRIDE_0
+            req_state_idx = tl.load(IDX_MAP + row_id)
+            temp = tl.load(TEMP + req_state_idx).to(tl.float32)
+        else:
+            OUT_ROW = LOGITS_ROW
 
         final_pivot = -float("inf")
         duplicate_logit = float("inf")
@@ -132,7 +185,7 @@ def _topk_topp_kernel(
                 mask_n = offs < VOCAB_SIZE
                 logits_blk0 = tl.load(
                     LOGITS_ROW + offs, mask=mask_n, other=-float("inf")
-                )
+                ).to(tl.float32)
                 # Exclude -inf values (e.g. from grammar bitmasks) from
                 # statistics to avoid NaN in pivot computation.
                 finite_mask = (logits_blk0 > -float("inf")) & mask_n
@@ -165,7 +218,7 @@ def _topk_topp_kernel(
                     mask_n = offs_n < VOCAB_SIZE
                     logits_blk = tl.load(
                         LOGITS_ROW + offs_n, mask=mask_n, other=-float("inf")
-                    )
+                    ).to(tl.float32)
 
                     max_logit = tl.maximum(max_logit, tl.max(logits_blk))
                     # Exclude -inf from min to keep binary search bounds
@@ -182,6 +235,14 @@ def _topk_topp_kernel(
                     num_outliers += tl.sum(outlier_mask)
                     write_pos = tl.where(outlier_mask, cumulative_pos, -1)
                     tl.store(BUFFER_ROW + write_pos, logits_blk, mask=outlier_mask)
+                    if CAND_FAST:
+                        tl.store(
+                            BUFFER_IDX_ROW + write_pos,
+                            offs_n,
+                            mask=outlier_mask & (write_pos < IDX_CAP),
+                        )
+                # Every warp's outlier stores before the search reads them.
+                tl.debug_barrier()
 
                 # If no finite logits exist (all -inf), clamp min to
                 # max so the search converges to -inf (no masking).
@@ -194,6 +255,7 @@ def _topk_topp_kernel(
                 min_larger = float("inf")
                 num_min_larger = tl.zeros((), dtype=tl.uint32)
                 if num_outliers > k:
+                    used_outliers = tl.full((), 1, dtype=tl.int32)
                     max_range = max_logit
                     min_range = outlier_pivot
                     search_range = tl.cast(num_outliers, tl.int32)
@@ -306,7 +368,7 @@ def _topk_topp_kernel(
                             mask_n = offs_n < VOCAB_SIZE
                             logits_blk2 = tl.load(
                                 LOGITS_ROW + offs_n, mask=mask_n, other=-float("inf")
-                            )
+                            ).to(tl.float32)
 
                             above_0 = logits_blk2 > k_pivot_0
                             above_1 = logits_blk2 > k_pivot_1
@@ -458,7 +520,7 @@ def _topk_topp_kernel(
                                     LOGITS_ROW + offs_n,
                                     mask=mask_n,
                                     other=-float("inf"),
-                                )
+                                ).to(tl.float32)
 
                                 outlier_mask = (probs_blk > min_logit) & mask_n
 
@@ -492,6 +554,7 @@ def _topk_topp_kernel(
                                 tl.store(
                                     BUFFER_ROW + write_pos, probs_blk, mask=outlier_mask
                                 )
+                            tl.debug_barrier()
 
                             search_range = tl.cast(num_outliers_2, tl.int32)
                             search_iters = tl.cast(
@@ -512,6 +575,7 @@ def _topk_topp_kernel(
                                 )
                                 probs_blk = probs_blk / sum_exp_logits
                                 tl.store(BUFFER_ROW + offs_n, probs_blk, mask=mask_n_2)
+                        tl.debug_barrier()
 
                         max_range = tl.exp(max_logit - max_logit) / sum_exp_logits
                         min_range = tl.exp(min_logit - max_logit) / sum_exp_logits
@@ -601,7 +665,7 @@ def _topk_topp_kernel(
                 mask_n = offs < VOCAB_SIZE
                 logits_blk0 = tl.load(
                     LOGITS_ROW + offs, mask=mask_n, other=-float("inf")
-                )
+                ).to(tl.float32)
                 # Exclude -inf values (e.g. from grammar bitmasks) from
                 # statistics to avoid NaN in pivot computation.
                 finite_mask = (logits_blk0 > -float("inf")) & mask_n
@@ -627,7 +691,7 @@ def _topk_topp_kernel(
                     mask_n = offs_n < VOCAB_SIZE
                     logits_blk = tl.load(
                         LOGITS_ROW + offs_n, mask=mask_n, other=-float("inf")
-                    )
+                    ).to(tl.float32)
                     max_logit = tl.maximum(max_logit, tl.max(logits_blk))
                     # Exclude -inf from min to keep binary search bounds
                     # finite (avoids NaN pivots).
@@ -661,7 +725,7 @@ def _topk_topp_kernel(
 
                     probs_blk = tl.load(
                         LOGITS_ROW + offs_n, mask=mask_n, other=-float("inf")
-                    )
+                    ).to(tl.float32)
                     probs_blk = tl.exp(probs_blk - max_sample)
                     probs_blk = probs_blk / sum_exp_logits
 
@@ -673,6 +737,7 @@ def _topk_topp_kernel(
                     num_outliers += tl.sum(outlier_mask)
                     write_pos = tl.where(outlier_mask, cumulative_pos, -1)
                     tl.store(BUFFER_ROW + write_pos, probs_blk, mask=outlier_mask)
+                tl.debug_barrier()
 
                 max_range = tl.exp(max_logit - max_sample) / sum_exp_logits
                 min_range = tl.exp(min_logit - max_sample) / sum_exp_logits
@@ -755,10 +820,11 @@ def _topk_topp_kernel(
 
                         probs_blk = tl.load(
                             LOGITS_ROW + offs_n, mask=mask_n, other=-float("inf")
-                        )
+                        ).to(tl.float32)
                         probs_blk = tl.exp(probs_blk - max_sample)
                         probs_blk = probs_blk / sum_exp_logits
                         tl.store(BUFFER_ROW + offs_n, probs_blk, mask=mask_n)
+                    tl.debug_barrier()
 
                     found_pivot = 0
                     while found_pivot == 0:
@@ -830,13 +896,72 @@ def _topk_topp_kernel(
         # Using `not <` instead of `>=` so that NaN is also caught.
         if not (final_pivot < max_logit):
             final_pivot = -float("inf")
-        elif final_pivot != -float("inf"):
-            for i in range(0, NUM_TILES):
+        # The fold writes every row, a pivot of -inf keeping all of it.
+        if FOLD or final_pivot != -float("inf"):
+            num_kept_0 = num_kept
+            num_cand = tl.zeros((), dtype=tl.int32)
+            CAND_ROW = row_id.to(tl.int64) * CAND_STRIDE_0
+            fast = tl.zeros((), dtype=tl.int32)
+            if CAND_FAST and not TOPP_ENABLED:  # noqa: SIM102 - Triton compile-time branch
+                # Every kept token is above final_pivot >= outlier_pivot, and a
+                # duplicate of duplicate_logit (> final_pivot) at least 1e-9
+                # above outlier_pivot cannot match a non-outlier, so the buffer
+                # (outliers in token order) yields the same list.
+                if (  # noqa: SIM102 - Triton compile-time branch
+                    (used_outliers != 0)
+                    & (num_outliers <= IDX_CAP)
+                    & (final_pivot > -float("inf"))
+                ):
+                    if (num_keep >= num_duplicate_logit) | (
+                        duplicate_logit - outlier_pivot >= 1e-9
+                    ):
+                        fast = tl.full((), 1, dtype=tl.int32)
+            if CAND_FAST:  # noqa: SIM102 - Triton compile-time branch
+                if fast != 0:
+                    n_out = tl.cast(num_outliers, tl.int32)
+                    for i in range(
+                        0, (n_out + BLOCK_SIZE_TRUNC - 1) // BLOCK_SIZE_TRUNC
+                    ):
+                        offs_b = i * BLOCK_SIZE_TRUNC + tl.arange(0, BLOCK_SIZE_TRUNC)
+                        mask_b = offs_b < n_out
+                        vals = tl.load(
+                            BUFFER_ROW + offs_b, mask=mask_b, other=-float("inf")
+                        ).to(tl.float32)
+                        ids = tl.load(BUFFER_IDX_ROW + offs_b, mask=mask_b, other=0)
+                        keep_mask = (vals > final_pivot) & mask_b
+                        if num_keep < num_duplicate_logit:
+                            duplicate_mask = (
+                                tl.abs(vals - duplicate_logit) < 1e-9
+                            ) & mask_b
+                            duplicate_count = tl.cumsum(duplicate_mask) + num_kept
+                            duplicate_keep_mask = (
+                                duplicate_count <= num_keep
+                            ) & duplicate_mask
+                            duplicate_remove_mask = (
+                                duplicate_mask & ~duplicate_keep_mask
+                            )
+                            num_kept += tl.sum(duplicate_keep_mask)
+                            keep_mask = keep_mask & (~duplicate_remove_mask)
+                        if temp != 0.0 and temp != 1.0:
+                            vals = vals / temp
+                        keep_i = keep_mask.to(tl.int32)
+                        tile_keep = tl.sum(keep_i)
+                        if tile_keep > 0:
+                            slot = tl.cumsum(keep_i) - 1 + num_cand
+                            cand_mask = keep_mask & (slot < CAND_MAX)
+                            tl.store(CAND_IDX + CAND_ROW + slot, ids, mask=cand_mask)
+                            tl.store(CAND_VAL + CAND_ROW + slot, vals, mask=cand_mask)
+                        num_cand += tile_keep
+            if CAND_FAST:  # noqa: SIM108 - Triton compile-time branch
+                n_tiles = tl.where(fast == 0, NUM_TILES, 0)
+            else:
+                n_tiles = NUM_TILES
+            for i in range(0, n_tiles):
                 offs_n = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
                 mask_n = offs_n < VOCAB_SIZE
                 logits_blk = tl.load(
                     LOGITS_ROW + offs_n, mask=mask_n, other=-float("inf")
-                )
+                ).to(tl.float32)
                 keep_mask = (logits_blk > final_pivot) & mask_n
 
                 # Duplicate logit handling
@@ -851,7 +976,79 @@ def _topk_topp_kernel(
                     keep_mask = keep_mask & (~duplicate_remove_mask)
 
                 logits_blk = tl.where(keep_mask, logits_blk, MASK_VALUE)
-                tl.store(LOGITS_ROW + offs_n, logits_blk, mask=mask_n)
+                if FOLD:  # noqa: SIM102 - Triton compile-time branch
+                    # The same division as _temperature_kernel, which skips
+                    # temperatures 0 and 1.
+                    if temp != 0.0 and temp != 1.0:
+                        logits_blk = logits_blk / temp
+                if CAND:
+                    keep_i = keep_mask.to(tl.int32)
+                    tile_keep = tl.sum(keep_i)
+                    if tile_keep > 0:
+                        slot = tl.cumsum(keep_i) - 1 + num_cand
+                        cand_mask = keep_mask & (slot < CAND_MAX)
+                        tl.store(CAND_IDX + CAND_ROW + slot, offs_n, mask=cand_mask)
+                        tl.store(CAND_VAL + CAND_ROW + slot, logits_blk, mask=cand_mask)
+                    num_cand += tile_keep
+                else:
+                    tl.store(OUT_ROW + offs_n, logits_blk, mask=mask_n)
+                if FUSE_STATS:
+                    tile_max, tile_idx = tl.max(logits_blk, axis=0, return_indices=True)
+                    tile_sumexp = tl.where(
+                        tile_max > -float("inf"),
+                        tl.sum(tl.exp(logits_blk - tile_max)),
+                        0.0,
+                    )
+                    stats_off = row_id.to(tl.int64) * STATS_STRIDE_0 + i
+                    tl.store(STATS_ARGMAX + stats_off, i * BLOCK_SIZE + tile_idx)
+                    tl.store(STATS_MAX + stats_off, tile_max)
+                    tl.store(STATS_SUMEXP + stats_off, tile_sumexp)
+            if CAND:
+                tl.store(CAND_CNT + row_id, num_cand)
+                if num_cand > CAND_MAX:
+                    # Too many kept tokens for the candidate list: the same
+                    # pass again, writing the masked row.
+                    num_kept = num_kept_0
+                    for i in range(0, NUM_TILES):
+                        offs_n = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                        mask_n = offs_n < VOCAB_SIZE
+                        logits_blk = tl.load(
+                            LOGITS_ROW + offs_n, mask=mask_n, other=-float("inf")
+                        ).to(tl.float32)
+                        keep_mask = (logits_blk > final_pivot) & mask_n
+                        if num_keep < num_duplicate_logit:
+                            duplicate_mask = (
+                                tl.abs(logits_blk - duplicate_logit) < 1e-9
+                            ) & mask_n
+                            duplicate_count = tl.cumsum(duplicate_mask) + num_kept
+                            duplicate_keep_mask = (
+                                duplicate_count <= num_keep
+                            ) & duplicate_mask
+                            duplicate_remove_mask = (
+                                duplicate_mask & ~duplicate_keep_mask
+                            )
+                            num_kept += tl.sum(duplicate_keep_mask)
+                            keep_mask = keep_mask & (~duplicate_remove_mask)
+                        logits_blk = tl.where(keep_mask, logits_blk, MASK_VALUE)
+                        if temp != 0.0 and temp != 1.0:
+                            logits_blk = logits_blk / temp
+                        tl.store(OUT_ROW + offs_n, logits_blk, mask=mask_n)
+                        if FUSE_STATS and CAND_FAST:  # noqa: SIM102 - Triton compile-time branch
+                            if fast != 0:
+                                tile_max, tile_idx = tl.max(
+                                    logits_blk, axis=0, return_indices=True
+                                )
+                                tile_sumexp = tl.where(
+                                    tile_max > -float("inf"),
+                                    tl.sum(tl.exp(logits_blk - tile_max)),
+                                    0.0,
+                                )
+                                stats_off = row_id.to(tl.int64) * STATS_STRIDE_0 + i
+                                tl.store(
+                                    STATS_ARGMAX + stats_off, i * BLOCK_SIZE + tile_idx
+                                )
+                                tl.store(STATS_MAX + stats_off, tile_max)
+                                tl.store(STATS_SUMEXP + stats_off, tile_sumexp)
 
 
 def apply_top_k_top_p_triton(
@@ -859,9 +1056,30 @@ def apply_top_k_top_p_triton(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
     mask_value: float = float("-inf"),
+    fold: tuple | None = None,
+    cand: tuple | None = None,
+    cand_fast: bool = False,
 ) -> torch.Tensor:
     """
     Apply combined top-k and top-p masking using Triton.
+
+    fold = (out, temperature, idx_mapping, stats) runs top-k only (p None),
+    reads logits of any float dtype without touching them and writes the masked
+    row divided by temperature[idx_mapping[row]] (as _temperature_kernel does,
+    skipping 0 and 1) into out, an fp32 tensor of the same shape; stats, None or
+    (argmax, max, sumexp) tensors of shape [batch, ceil(vocab / 8192)], receives
+    each 8192-wide tile's statistics of the written row for the rejection
+    sampler. Returns out.
+
+    cand = (idx, val, cnt), with fold only, replaces the masked row by the
+    kept tokens: idx [batch, C] int32 receives their positions in ascending
+    order, val [batch, C] fp32 the values the row would hold there, and
+    cnt [batch] int32 how many were kept. A row keeping more than C tokens
+    has only its first C listed and its masked row written to out.
+    cand_fast (with cand) lets a top-k row whose cutoff came from the outlier
+    buffer emit its list from that buffer, skipping the final full read; such
+    rows get no stats unless they keep more than C tokens, so the consumer
+    must take the target's logsumexp and argmax from the list.
 
     Top-k is applied first (by logit value), then top-p is applied
     to the remaining k values (by probability).
@@ -879,10 +1097,18 @@ def apply_top_k_top_p_triton(
         The masked logits tensor. It may or may not be modified in-place.
     """
     assert logits.ndim == 2
-    assert logits.dtype == torch.float32
+    assert logits.dtype == torch.float32 or fold is not None
     batch_size, vocab_size = logits.shape
     topk_enabled = k is not None
     topp_enabled = p is not None
+    if fold is None:
+        out, temperature, idx_mapping, stats = logits, logits, logits, None
+    else:
+        out, temperature, idx_mapping, stats = fold
+        assert topk_enabled and not topp_enabled, "the fold covers top-k rows only"
+        assert out.shape == logits.shape and out.dtype == torch.float32
+        assert out.stride(1) == 1 and logits.stride(1) == 1
+        assert idx_mapping.shape == (batch_size,)
 
     if batch_size == 0 or not (topk_enabled or topp_enabled):
         return logits
@@ -946,6 +1172,50 @@ def apply_top_k_top_p_triton(
         # faster on every arch measured (SM90, SM100, SM120, gfx950); 16 is not.
         launch_kwargs["num_warps"] = 8
 
+    if cand is None:
+        cand_idx = cand_val = cand_cnt = logits
+        cand_stride, cand_max = 0, 256
+    else:
+        assert fold is not None, "candidates come from the fold only"
+        cand_idx, cand_val, cand_cnt = cand
+        cand_max = cand_idx.shape[1]
+        assert cand_max & (cand_max - 1) == 0
+        assert cand_idx.dtype == cand_cnt.dtype == torch.int32
+        assert cand_val.dtype == torch.float32 and cand_val.shape == cand_idx.shape
+        assert cand_idx.shape[0] == batch_size and cand_cnt.shape == (batch_size,)
+        assert cand_idx.stride(1) == cand_val.stride(1) == 1
+        assert cand_idx.stride(0) == cand_val.stride(0)
+        cand_stride = cand_idx.stride(0)
+    cand_fast = cand_fast and cand is not None and not topp_enabled
+    idx_cap = 32768
+    if cand_fast:
+        idx_key = (logits.device, "cand_idx")
+        buffer_idx = _TRITON_BUFFER_CACHE.get(idx_key)
+        if buffer_idx is None or buffer_idx.shape[0] < NUM_PROGRAMS:
+            buffer_idx = torch.empty(
+                (num_sm, idx_cap), dtype=torch.int32, device=logits.device
+            )
+            _TRITON_BUFFER_CACHE[idx_key] = buffer_idx
+    else:
+        buffer_idx = logits
+
+    if stats is None:
+        stats_argmax = stats_max = stats_sumexp = logits
+        stats_stride = 0
+    else:
+        stats_argmax, stats_max, stats_sumexp = stats
+        num_tiles = (vocab_size + block_size - 1) // block_size
+        for t in stats:
+            assert t.shape == (batch_size, num_tiles) and t.stride(1) == 1, (
+                t.shape,
+                batch_size,
+                num_tiles,
+            )
+        assert stats_argmax.dtype == torch.int64
+        assert stats_max.dtype == stats_sumexp.dtype == torch.float32
+        stats_stride = stats_max.stride(0)
+        assert stats_argmax.stride(0) == stats_sumexp.stride(0) == stats_stride
+
     _topk_topp_kernel[(NUM_PROGRAMS,)](
         logits,
         logits.stride(0),
@@ -954,6 +1224,19 @@ def apply_top_k_top_p_triton(
         normal_cdf_to_sigma_table,
         k_ptr,
         p_ptr,
+        out,
+        out.stride(0),
+        temperature,
+        idx_mapping,
+        stats_argmax,
+        stats_max,
+        stats_sumexp,
+        stats_stride,
+        cand_idx,
+        cand_val,
+        cand_cnt,
+        cand_stride,
+        buffer_idx,
         BATCH_SIZE=batch_size,
         MASK_VALUE=mask_value,
         VOCAB_SIZE=vocab_size,
@@ -961,10 +1244,16 @@ def apply_top_k_top_p_triton(
         BLOCK_SIZE_TRUNC=block_size_trunc,
         TOPK_ENABLED=topk_enabled,
         TOPP_ENABLED=topp_enabled,
+        FOLD=fold is not None,
+        FUSE_STATS=stats is not None,
+        CAND=cand is not None,
+        CAND_MAX=cand_max,
+        CAND_FAST=cand_fast,
+        IDX_CAP=idx_cap,
         **launch_kwargs,
     )
 
-    return logits
+    return out
 
 
 def reset_buffer_cache():

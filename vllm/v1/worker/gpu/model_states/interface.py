@@ -123,6 +123,16 @@ class ModelState(ABC):
     def remove_request(self, req_id: str) -> None:
         return None
 
+    def set_decode_tail_targets(
+        self,
+        targets: dict[str, dict[int, tuple[int, int]]],
+        req_id_to_index: dict[str, int],
+    ) -> None:
+        """Keep the scheduler's decode-tail targets for the requests' recurrent
+        state (SchedulerOutput.decode_tail_targets); only a hybrid with GDN
+        RecoverSSM writes them."""
+        return None
+
     def apply_staged_writes(self) -> None:
         return None
 
@@ -134,6 +144,21 @@ class ModelState(ABC):
         ``ALWAYS`` imposes no extra constraint on the runner's cudagraph mode.
         """
         return AttentionCGSupport.ALWAYS, None
+
+    def register_zero_recurrent(self, req_id: str, target: int) -> None:
+        """Arm SamplingParams.zero_recurrent_state for a request.
+
+        Only hybrid recurrent model states implement this; for every other
+        model the parameter has nothing to act on, so asking for it is a
+        configuration error rather than a silent no-op.
+        """
+        raise ValueError(
+            "zero_recurrent_state was requested, but this model has no "
+            "recurrent state to blank."
+        )
+
+    def drop_zero_recurrent(self, req_id: str) -> None:
+        return
 
     def preprocess_state(
         self,
@@ -152,7 +177,15 @@ class ModelState(ABC):
         idx_mapping: torch.Tensor,
         num_sampled: torch.Tensor,
         num_computed_tokens: torch.Tensor | None = None,
+        deferred_postprocess: Any = None,
     ) -> None:
+        return None
+
+    def take_deferred_postprocess(self) -> Any:
+        """What this step's postprocess needs from the step itself, where a
+        pipeline stage before the last runs it ``pp_size`` steps later, once
+        the last stage's sampled tokens arrive (``PPHandler``). Handed back as
+        ``postprocess_state``'s ``deferred_postprocess``. None by default."""
         return None
 
     @abstractmethod

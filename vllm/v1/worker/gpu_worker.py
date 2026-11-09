@@ -12,7 +12,6 @@ from types import NoneType
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import regex as re
 import torch
 import torch.nn as nn
 
@@ -63,6 +62,7 @@ from vllm.profiler.wrapper import (
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
+from vllm.utils import memory_log
 from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
 from vllm.utils.mem_constants import GiB_bytes
@@ -322,27 +322,32 @@ class Worker(WorkerBase):
 
     @contextmanager
     def _scoped_allocator_max_split(self, max_split_size_mb: int):
-        """Temporarily set max_split_size_mb to reduce allocator fragmentation at the
-        cost of more cudaMalloc calls (negligible in practice). Restores the original
-        value on exit."""
-        if not current_platform.is_cuda():
+        """Limit CUDA/ROCm allocator splitting, restoring settings on exit."""
+        if (
+            not current_platform.is_cuda_alike()
+            or torch.cuda.memory.get_allocator_backend() != "native"
+        ):
             yield
             return
 
-        conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-        match = re.search(r"max_split_size_mb:(\d+)", conf)
-        original_value = match.group(1) if match else None
+        get_settings = getattr(torch._C, "_accelerator_getAllocatorSettings", None)
+        if get_settings is not None:
+            original_settings = get_settings()
+        else:
+            original_settings = torch.cuda.memory._snapshot()["allocator_settings"][
+                "PYTORCH_CUDA_ALLOC_CONF"
+            ]
 
-        torch._C._accelerator_setAllocatorSettings(
-            f"max_split_size_mb:{max_split_size_mb}"
-        )
+        # The setter resets other allocator options unless they are included.
+        prefix = original_settings.strip().rstrip(",")
+        settings = f"max_split_size_mb:{max_split_size_mb}"
+        if prefix:
+            settings = f"{prefix},{settings}"
         try:
+            torch._C._accelerator_setAllocatorSettings(settings)
             yield
         finally:
-            # PyTorch defaults to SIZE_MAX (no limit).
-            _SIZE_MAX_MB = (2**64 - 1) // (1024 * 1024)
-            restore = original_value if original_value else str(_SIZE_MAX_MB)
-            torch._C._accelerator_setAllocatorSettings(f"max_split_size_mb:{restore}")
+            torch._C._accelerator_setAllocatorSettings(original_settings)
 
     @instrument(span_name="Init device")
     def init_device(self):
@@ -410,6 +415,21 @@ class Worker(WorkerBase):
             )
             self.device = torch.device(f"cuda:{visible_device_index}")
             torch.accelerator.set_device_index(self.device)
+            memory_log.bind_device(visible_device_index)
+            if envs.VLLM_DEVICE_MEMORY_LIMIT_GIB:
+                # Before anything is allocated: the caching allocator refuses
+                # past the fraction from here on, which is what makes a boot
+                # on this card fail where it would fail on the smaller one.
+                limit_bytes = float(envs.VLLM_DEVICE_MEMORY_LIMIT_GIB) * (1 << 30)
+                total_bytes = torch.cuda.get_device_properties(self.device).total_memory
+                fraction = min(1.0, limit_bytes / total_bytes)
+                torch.cuda.set_per_process_memory_fraction(fraction, self.device)
+                logger.info(
+                    "Device memory limited to %s GiB of %s (allocator fraction %.4f)",
+                    envs.VLLM_DEVICE_MEMORY_LIMIT_GIB,
+                    format_gib(total_bytes),
+                    fraction,
+                )
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
@@ -486,6 +506,8 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        memory_log.maybe_start()
+        memory_log.report("load_model enter")
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
@@ -493,6 +515,7 @@ class Worker(WorkerBase):
             self._scoped_allocator_max_split(max_split_size_mb=20),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        memory_log.report("load_model exit")
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
@@ -522,7 +545,9 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        memory_log.mark("determine_available_memory enter")
         maybe_apply_startup_plan(self)
+        memory_log.mark("startup plan applied")
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
@@ -550,11 +575,23 @@ class Worker(WorkerBase):
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
-        with memory_profiling(
-            self.init_snapshot,
-            weights_memory=int(self.model_runner.model_memory_usage),
-        ) as profile_result:
+        memory_log.mark("profile_run enter")
+        with (
+            memory_profiling(
+                self.init_snapshot,
+                weights_memory=int(self.model_runner.model_memory_usage),
+            ) as profile_result,
+            # Workspaces (e.g. the MoE workspace) grow in steps during this pass,
+            # freeing each smaller buffer. Without a split limit, a later small
+            # allocation can be carved out of a freed multi-GiB block and pin the
+            # whole segment past the empty_cache() in memory_profiling, so it is
+            # counted as consumed and taken from the KV cache. Blocks above the
+            # limit are never split, so they stay releasable. Exits before
+            # memory_profiling measures, restoring the original limit.
+            self._scoped_allocator_max_split(max_split_size_mb=20),
+        ):
             self.model_runner.profile_run()
+        memory_log.mark("profile_run exit")
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -562,12 +599,19 @@ class Worker(WorkerBase):
         # the AMD-CI mem tests), and graph_pool_handle resolves to the same
         # torch.cuda handle the live capture path already uses on ROCm.
         # XPU stays excluded (see #39977).
+        # Only when the estimate is applied: the profile is itself a capture
+        # (two minutes of a B200 boot for Qwen4Exp's ladder), and with
+        # VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 its result would be
+        # discarded, so the graphs are then captured once, after the KV cache.
         cudagraph_memory_estimate = 0
         if (
-            current_platform.is_cuda_alike()
+            envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+            and current_platform.is_cuda_alike()
             and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
+            memory_log.mark("profile_cudagraph_memory enter")
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+            memory_log.mark("profile_cudagraph_memory exit")
 
         # Respect the opt-in flag as originally designed.
         cudagraph_memory_estimate_applied = (
@@ -627,44 +671,36 @@ class Worker(WorkerBase):
             format_gib(self.available_kv_cache_memory_bytes),
         )
 
-        if cudagraph_memory_estimate > 0:
+        if not envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:
+            logger.warning(
+                "CUDA graph memory profiling is disabled "
+                "(VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0): the graphs are "
+                "captured once, after the KV cache, and their memory is not "
+                "accounted for during its allocation, which may require "
+                "lowering --gpu-memory-utilization to avoid OOM. With it on, "
+                "the boot log names the equivalent utilization."
+            )
+        elif cudagraph_memory_estimate > 0:
             total_mem = self.init_snapshot.total_memory
             current_util = self.cache_config.gpu_memory_utilization
             cg_util_delta = cudagraph_memory_estimate / total_mem
-            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:
-                equiv_util = round(current_util - cg_util_delta, 4)
-                suggested_util = min(
-                    round(current_util + cg_util_delta, 4),
-                    1.0,
-                )
-                logger.info(
-                    "CUDA graph memory profiling is enabled (default since "
-                    "v0.21.0). The current --gpu-memory-utilization=%.4f is "
-                    "equivalent to --gpu-memory-utilization=%.4f without "
-                    "CUDA graph memory profiling. To maintain the same "
-                    "effective KV cache size as before, increase "
-                    "--gpu-memory-utilization to %.4f. To disable, set "
-                    "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.",
-                    current_util,
-                    equiv_util,
-                    suggested_util,
-                )
-            else:
-                suggested_util = min(
-                    round(current_util + cg_util_delta, 4),
-                    1.0,
-                )
-                logger.warning(
-                    "CUDA graph memory profiling is disabled "
-                    "(VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0). "
-                    "Without it, CUDA graph memory is not accounted for "
-                    "during KV cache allocation, which may require lowering "
-                    "--gpu-memory-utilization to avoid OOM. Consider "
-                    "re-enabling it (the default as of v0.21.0) and increasing "
-                    "--gpu-memory-utilization from %.4f to %.4f.",
-                    current_util,
-                    suggested_util,
-                )
+            equiv_util = round(current_util - cg_util_delta, 4)
+            suggested_util = min(
+                round(current_util + cg_util_delta, 4),
+                1.0,
+            )
+            logger.info(
+                "CUDA graph memory profiling is enabled (default since "
+                "v0.21.0). The current --gpu-memory-utilization=%.4f is "
+                "equivalent to --gpu-memory-utilization=%.4f without "
+                "CUDA graph memory profiling. To maintain the same "
+                "effective KV cache size as before, increase "
+                "--gpu-memory-utilization to %.4f. To disable, set "
+                "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.",
+                current_util,
+                equiv_util,
+                suggested_util,
+            )
 
         return reserve_mm_ipc_gpu_memory(
             int(self.available_kv_cache_memory_bytes),
@@ -711,6 +747,7 @@ class Worker(WorkerBase):
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
+        memory_log.mark("initialize_from_config enter")
 
         # Update local config with adjusted num blocks after profiling,
         # so that it's available to the warmup stage.
@@ -748,6 +785,7 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        memory_log.mark("compile_or_warm_up_model enter")
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
@@ -922,6 +960,7 @@ class Worker(WorkerBase):
         # intra-op parallelism.
         set_torch_threads_for_runtime()
 
+        memory_log.stop("compile_or_warm_up_model exit")
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,

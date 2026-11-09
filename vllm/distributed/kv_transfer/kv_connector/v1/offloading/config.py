@@ -4,6 +4,7 @@
 
 from typing import TYPE_CHECKING
 
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -12,6 +13,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    is_transient_spec,
 )
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
@@ -20,6 +22,8 @@ from vllm.v1.kv_offload.config import (
     OffloadingModelConfig,
     OffloadingParallelConfig,
 )
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -54,7 +58,22 @@ def build_offloading_config(
     )
 
     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
-    for group in groups:
+    for idx, (group, kv_cache_group) in enumerate(
+        zip(groups, kv_cache_config.kv_cache_groups)
+    ):
+        transient = is_transient_spec(kv_cache_group.kv_cache_spec)
+        logger.info(
+            "KV offloading group %d: %s, %d tokens per block, %d layers%s",
+            idx,
+            type(kv_cache_group.kv_cache_spec).__name__,
+            group.tokens_per_block,
+            len(group.layer_names),
+            ", transient" if transient else "",
+        )
+        if transient:
+            # One block per request of scratch state the core never
+            # prefix-caches; the connector passes over it.
+            continue
         assert group.tokens_per_block % tokens_per_hash == 0, (
             f"tokens_per_block={group.tokens_per_block} not divisible by "
             f"tokens_per_hash={tokens_per_hash}. "
@@ -99,6 +118,15 @@ def build_offloading_config(
         # so its size is the total, not a per-tensor share.
         total_gpu_kv_bytes = kv_cache_config.kv_cache_tensors[0].size
         worker_kv_bytes_per_block = total_gpu_kv_bytes // kv_cache_config.num_blocks
+        # The workers share one host region laid out in equal per-worker slots,
+        # and the scheduler sizes it from its own copy of the first worker's
+        # config. Pipeline stages holding different layers have blocks of
+        # different sizes, so every side takes the largest.
+        if kv_cache_config.max_worker_kv_bytes_per_block is not None:
+            worker_kv_bytes_per_block = max(
+                worker_kv_bytes_per_block,
+                kv_cache_config.max_worker_kv_bytes_per_block,
+            )
 
     single_group_spec = (
         kv_cache_config.kv_cache_groups[0].kv_cache_spec

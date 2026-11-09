@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from enum import Enum
 
 import torch
@@ -90,21 +91,21 @@ def backend_to_kernel_cls(
         ]
 
     elif backend == NvFp4MoeBackend.FLASHINFER_CUTLASS:
-        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import (  # noqa: E501
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import (  # noqa: E501  # noqa: E501
             FlashInferExperts,
         )
 
         return [FlashInferExperts]
 
     elif backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL:
-        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (  # noqa: E501
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (  # noqa: E501  # noqa: E501
             FlashInferCuteDSLExperts,
         )
 
         return [FlashInferCuteDSLExperts]
 
     elif backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED:
-        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_batched_moe import (  # noqa: E501
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_batched_moe import (  # noqa: E501  # noqa: E501
             FlashInferCuteDSLBatchedExperts,
         )
 
@@ -129,6 +130,14 @@ def backend_to_kernel_cls(
             MarlinExperts,
         )
 
+        if os.environ.get("XKB_XMOE", "0") == "1":
+            # MarlinExperts subclass: layers prepared for xmoe run it,
+            # others run Marlin.
+            from vllm.model_executor.layers.fused_moe.experts.xmoe_experts import (
+                XmoeExperts,
+            )
+
+            return [XmoeExperts]
         return [MarlinExperts]
     elif backend == NvFp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
@@ -174,8 +183,13 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
 
 
 def _use_a16(backend: NvFp4MoeBackend, checkpoint_uses_a16: bool) -> bool:
-    return checkpoint_uses_a16 or (
-        backend == NvFp4MoeBackend.B12X and envs.VLLM_B12X_MOE_FP4_FORCE_A16
+    return (
+        checkpoint_uses_a16
+        or (backend == NvFp4MoeBackend.B12X and envs.VLLM_B12X_MOE_FP4_FORCE_A16)
+        or (
+            backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL
+            and envs.VLLM_CUTEDSL_MOE_FP4_FORCE_A16
+        )
     )
 
 
@@ -448,23 +462,40 @@ def convert_to_nvfp4_moe_kernel_format(
     elif nvfp4_backend == NvFp4MoeBackend.MARLIN:
         a13_scale = None
         a2_scale = None
-        (
-            w13,
-            w13_scale,
-            w13_scale_2,
-            w2,
-            w2_scale,
-            w2_scale_2,
-        ) = prepare_nvfp4_moe_layer_for_marlin(
-            layer=layer,
-            w13=w13,
-            w13_scale=w13_scale,
-            w13_scale_2=w13_scale_2,
-            w2=w2,
-            w2_scale=w2_scale,
-            w2_scale_2=w2_scale_2,
-            is_act_and_mul=is_act_and_mul,
-        )
+        xmoe_weights = None
+        if os.environ.get("XKB_XMOE", "0") == "1":
+            from vllm.model_executor.layers.fused_moe.experts import xmoe_experts
+
+            xmoe_weights = xmoe_experts.prepare(
+                layer,
+                w13,
+                w13_scale,
+                w13_scale_2,
+                w2,
+                w2_scale,
+                w2_scale_2,
+                is_act_and_mul,
+            )
+        if xmoe_weights is not None:
+            w13, w13_scale, w13_scale_2, w2, w2_scale, w2_scale_2 = xmoe_weights
+        else:
+            (
+                w13,
+                w13_scale,
+                w13_scale_2,
+                w2,
+                w2_scale,
+                w2_scale_2,
+            ) = prepare_nvfp4_moe_layer_for_marlin(
+                layer=layer,
+                w13=w13,
+                w13_scale=w13_scale,
+                w13_scale_2=w13_scale_2,
+                w2=w2,
+                w2_scale=w2_scale,
+                w2_scale_2=w2_scale_2,
+                is_act_and_mul=is_act_and_mul,
+            )
     elif nvfp4_backend == NvFp4MoeBackend.EMULATION:
         # Move the E2M1 lookup table to the device now, because
         # `.to(device)` is not allowed during CUDA graph capture.
@@ -564,6 +595,18 @@ def make_nvfp4_moe_quant_config(
     if backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL:
         w13_scale = nvfp4_swizzled_scale_to_cutedsl_mma_view(w13_scale)
         w2_scale = nvfp4_swizzled_scale_to_cutedsl_mma_view(w2_scale)
+        if use_a16:
+            # BF16 activations: the alphas are the weights' own global scales,
+            # with no activation scale folded in.
+            return nvfp4_w4a16_moe_quant_config(
+                g1_alphas=w13_scale_2,
+                g2_alphas=w2_scale_2,
+                w1_scale=w13_scale,
+                w2_scale=w2_scale,
+                gemm1_alpha=swiglu_alpha,
+                gemm1_beta=swiglu_beta,
+                gemm1_clamp_limit=swiglu_limit,
+            )
 
     # Pass w13_scale_2 / w2_scale_2 directly as g1/g2_alphas.
     # The expert's process_weights_after_loading will fuse activation

@@ -393,6 +393,55 @@ def test_synthetic_rejection_sample(
         )
 
 
+@pytest.mark.parametrize(
+    "accept_threshold_single,accept_threshold_acc,expected_rate",
+    [
+        (1.0, 1.0, 0.2),  # exact: accepted with the target's probability
+        (1.0, 0.5, 0.4),  # min(1, p / 0.5)
+        (1.0, 0.1, 1.0),  # min(1, p / 0.1)
+        (0.15, 1.0, 1.0),  # p >= 0.15: accepted outright
+        (0.3, 1.0, 0.2),  # p < 0.3: the exact test decides
+    ],
+)
+def test_relaxed_acceptance_rate(
+    accept_threshold_single: float, accept_threshold_acc: float, expected_rate: float
+):
+    """SGLang's relaxed acceptance on a one-hot draft (no draft logits, its
+    target-only case): the draft token has target probability p = 0.2, and is
+    accepted with probability min(1, p / threshold_acc), or always once
+    p >= threshold_single."""
+    torch.manual_seed(42)
+    device = "cuda"
+    num_trials = 10 * VOCAB_SIZE
+    p = 0.2
+
+    target_logits_1d = torch.full(
+        (VOCAB_SIZE,), math.log((1 - p) / (VOCAB_SIZE - 1)), device=device
+    )
+    target_logits_1d[0] = math.log(p)
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d,
+        target_logits_1d,
+        1,
+        temperature=1.0,
+        num_trials=num_trials,
+    )
+    inputs["draft_logits"] = None
+    inputs["draft_sampled"] = torch.zeros_like(inputs["draft_sampled"])
+
+    _, num_sampled = rejection_sample(
+        **inputs,
+        num_speculative_steps=1,
+        accept_threshold_single=accept_threshold_single,
+        accept_threshold_acc=accept_threshold_acc,
+    )
+
+    observed_rate = (num_sampled >= 2).float().mean().item()
+    assert abs(observed_rate - expected_rate) < 1e-2, (
+        f"observed acceptance {observed_rate:.4f}, expected {expected_rate:.4f}"
+    )
+
+
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
 def test_all_nan_target_logits_in_range(temperature: float):
     """Regression test for NaN breaking tl.argmax index bounds.

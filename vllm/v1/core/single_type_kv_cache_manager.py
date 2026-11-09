@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -32,6 +33,44 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
+
+
+def committed_decode_boundary(
+    request: Request, unit: int, block_size: int
+) -> int | None:
+    """The last ``unit`` boundary of the request's committed tokens past its
+    prompt, inside a block, whose key can be computed; or None. Under
+    speculative decoding the scheduler's computed count runs ahead of what
+    has been verified (``num_in_flight_tokens``), and only a committed token
+    has final KV and state."""
+    committed = request.num_computed_tokens - request.num_in_flight_tokens
+    boundary = committed // unit * unit
+    if boundary <= request.num_prompt_tokens or boundary % block_size == 0:
+        return None
+    if len(request.block_hashes) < boundary // unit:
+        return None
+    return boundary
+
+
+def decode_tail_boundary(request: Request, unit: int, block_size: int) -> int | None:
+    """The decode boundary ``request`` stands on as its next step is scheduled
+    (``CacheConfig.prefix_cache_decode_tail``), or None.
+
+    Its computed tokens -- what the previous steps wrote, and so what the
+    running state holds until this step's forward -- end on a ``unit``
+    boundary past the prompt, inside a block (a block boundary has its own
+    entry), and every token up to it is known, so its key can be computed.
+    """
+    boundary = request.num_computed_tokens
+    if boundary <= request.num_prompt_tokens:
+        return None  # prefill: the prompt's last boundary has its own entry
+    if boundary % unit != 0 or boundary % block_size == 0:
+        return None
+    if len(request.block_hashes) < boundary // unit:
+        return None
+    return boundary
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -108,6 +147,21 @@ class SingleTypeKVCacheManager(ABC):
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
 
+        # CacheConfig.prefix_cache_decode_tail: the hash unit decode tails land
+        # on, set by the coordinator when they are kept; None otherwise. And
+        # how they are taken (KVCacheConfig.decode_tail_mode).
+        self.decode_tail_unit: int | None = None
+        self.decode_tail_mode: str | None = None
+        # CacheConfig.prefix_cache_evict_superseded_first, set by the
+        # coordinator; and per request, whether it resumed a conversation of
+        # its own (its hit ends on a block no other request has taken).
+        self.evict_superseded_first = False
+        self._resumed_own: dict[str, bool] = {}
+        # The full-attention manager whose blocks tell whether other running
+        # requests share a prefix (set by the coordinator for recurrent
+        # groups when superseded blocks go first).
+        self.attention_probe: SingleTypeKVCacheManager | None = None
+
         # Whether this group's prefix-cache hits drop the EAGLE/MTP lookahead
         # block. Only consulted by managers whose hit logic is sparse within an
         # aligned segment (SWA). Initialized lazily by the coordinator after
@@ -154,6 +208,7 @@ class SingleTypeKVCacheManager(ABC):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        read_only: bool = False,
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -174,6 +229,9 @@ class SingleTypeKVCacheManager(ABC):
             apply_admission_cap: If True, clamp by `num_required_blocks` by
                 `_max_admission_blocks_per_request`for recycling-aware specs
                 (SWA, chunked-local).
+            read_only: If True, record nothing for the step the count predicts,
+                as for a reservation no allocation follows. An admission-capped
+                count records nothing either way.
 
         Returns:
             The number of blocks to allocate.
@@ -271,6 +329,16 @@ class SingleTypeKVCacheManager(ABC):
         # Touch the computed blocks to make sure they won't be evicted.
         if self.enable_caching:
             self.block_pool.touch(new_computed_blocks)
+            if self.evict_superseded_first:
+                for block in new_computed_blocks:
+                    if not block.is_null:
+                        block.num_hits += 1
+                last_hit = next(
+                    (b for b in reversed(new_computed_blocks) if not b.is_null), None
+                )
+                self._resumed_own[request_id] = (
+                    last_hit is not None and last_hit.num_hits == 1
+                )
         else:
             assert not any(new_computed_blocks), (
                 "Computed blocks should be empty when prefix caching is disabled"
@@ -328,6 +396,27 @@ class SingleTypeKVCacheManager(ABC):
             0, cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
         )
         allocated_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+        req_blocks.extend(allocated_blocks)
+        if self._record_new_block_ids:
+            self.new_block_ids.extend(b.block_id for b in allocated_blocks)
+
+    def allocate_fill_block(
+        self, request_id: str, num_local_computed_tokens: int
+    ) -> None:
+        """
+        Allocate the block(s) a connector fills for a divergent hit: what an
+        external hit ending exactly at `num_local_computed_tokens` would get,
+        after `add_local_computed_blocks` (called with no local blocks for
+        this group) padded the skipped ones with nulls. For a single-state
+        group that is one block, at the last chunk of the local hit.
+
+        Must run after every group's local blocks have been touched, for the
+        same reason as `allocate_external_computed_blocks`.
+        """
+        req_blocks = self.req_to_blocks[request_id]
+        allocated_blocks = self.block_pool.get_new_blocks(
+            cdiv(num_local_computed_tokens, self.block_size) - len(req_blocks)
+        )
         req_blocks.extend(allocated_blocks)
         if self._record_new_block_ids:
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
@@ -392,6 +481,20 @@ class SingleTypeKVCacheManager(ABC):
         self._pending_cow_copies = []
         return pending_copies
 
+    def take_decode_tail_updates(self) -> dict[str, tuple[int, int]]:
+        """Drain decode-tail targets for the worker: request -> (boundary,
+        block id), boundary 0 to clear. Only mamba "align" in "recover" mode
+        populates this."""
+        return {}
+
+    def context_thread_blocks(
+        self, request_id: str
+    ) -> list[tuple[KVCacheBlock, BlockHashWithGroupId]]:
+        """Cached blocks of the request's thread that its block list does not
+        hold (``CacheConfig.prefix_cache_context_threads``): a mamba decode
+        tail."""
+        return []
+
     def take_pending_boundary_state_offloads(
         self,
     ) -> list[tuple[str, int, KVCacheBlock, int]]:
@@ -406,6 +509,27 @@ class SingleTypeKVCacheManager(ABC):
         pending = self._pending_boundary_state_offloads
         self._pending_boundary_state_offloads = []
         return pending
+
+    def _prefix_shared(self, request_id: str, num_tokens: int) -> bool:
+        """Whether another running request holds the attention for this
+        request's full blocks up to ``num_tokens``: a prefix conversations
+        share (a system prompt), whose recurrent states are not the request's
+        to supersede. A boundary inside the first block counts as shared.
+        (The block the boundary falls in is left out: after a partial hit it
+        is the request's own copy, with a reference held until the copy has
+        run.) Without a probe, never."""
+        attention = self.attention_probe
+        if attention is None:
+            return False
+        block_idx = num_tokens // attention.block_size - 1
+        if block_idx < 0:
+            return True
+        blocks = attention.req_to_blocks.get(request_id)
+        return (
+            blocks is not None
+            and block_idx < len(blocks)
+            and blocks[block_idx].ref_cnt > 1
+        )
 
     def _apply_cow(
         self,
@@ -519,6 +643,7 @@ class SingleTypeKVCacheManager(ABC):
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
+        self._resumed_own.pop(request_id, None)
         return req_blocks
 
     def free(self, request_id: str) -> None:
@@ -797,6 +922,37 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if self.block_size == hash_block_size:
             return
         self._cache_partial_tail_block(request, num_tokens)
+        if self.decode_tail_unit is not None:
+            self._cache_decode_tail_block(request)
+
+    def _cache_decode_tail_block(self, request: Request) -> None:
+        """Key the tail block at the decode boundary the request stands on
+        (``CacheConfig.prefix_cache_decode_tail``). Attention KV is
+        append-only, so the block itself serves the entry: a hit copies it
+        before writing past the boundary. The entry replaces the block's
+        shorter partial one, as the prompt's last boundary is replaced."""
+        assert self.decode_tail_unit is not None
+        if self.decode_tail_mode == "recover":
+            boundary = committed_decode_boundary(
+                request, self.decode_tail_unit, self.block_size
+            )
+        else:
+            boundary = decode_tail_boundary(
+                request, self.decode_tail_unit, self.block_size
+            )
+        if boundary is None:
+            return
+        blocks = self.req_to_blocks[request.request_id]
+        block_idx = boundary // self.block_size
+        if block_idx >= len(blocks):
+            return
+        self.block_pool.cache_partial_block(
+            request=request,
+            block=blocks[block_idx],
+            num_tokens=boundary,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_size=self.block_size,
+        )
 
     def _cache_partial_tail_block(
         self,
@@ -925,10 +1081,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         )
         assert dcp_world_size == 1, "DCP not support sliding window attn now."
         assert pcp_world_size == 1, "PCP not support sliding window attn now."
-        # Fine-grained partial hits are not supported for sliding window now
-        assert alignment_tokens % kv_cache_spec.block_size == 0, (
-            "SlidingWindowManager does not support fine-grained (partial) cache hits"
-        )
+        # Sliding-window cache hits must stay at the group's physical block
+        # granularity. resolve_block_hashes() converts finer-grained hashes to
+        # that view when the hybrid-cache alignment is smaller than block_size.
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
@@ -1116,14 +1271,40 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
 
 
 class CircularBufferManager(FullAttentionManager):
-    """Claims the ring's single block per request; prefix caching disabled."""
+    """Claims the ring's single block per request; prefix caching disabled.
+
+    In the transient pool (``CacheConfig.transient_kv_pool``) the rings come
+    from the pool's free list, which every transient group's manager shares:
+    the groups' tensors overlay one allocation, so a ring ID may name one
+    group's ring at a time, as a shared-pool block ID does. The IDs index the
+    transient pool's allocation, never the shared pool's, so they count
+    against no shared capacity, are never zeroed with the shared pool's new
+    blocks, and go back to the list when their request's blocks are popped
+    for freeing.
+    """
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
+
+    def __init__(
+        self,
+        kv_cache_spec: KVCacheSpec,
+        transient_free: list[KVCacheBlock] | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(kv_cache_spec, **kwargs)
+        # The transient pool's free rings (transient_ring_free_list), shared
+        # with the other transient groups' managers; None without the pool.
+        self._transient_free = transient_free
 
     def _claim_ring_block(self, request_id: str) -> list[KVCacheBlock]:
         req_blocks = self.req_to_blocks[request_id]
         if req_blocks:
             return []
+        if self._transient_free is not None:
+            ring = self._transient_free.pop()
+            ring.ref_cnt = 1
+            req_blocks.append(ring)
+            return [ring]
         new_blocks = self.block_pool.get_new_blocks(1)
         req_blocks.extend(new_blocks)
         if self._record_new_block_ids:
@@ -1139,8 +1320,32 @@ class CircularBufferManager(FullAttentionManager):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        read_only: bool = False,
     ) -> int:
-        return 0 if self.req_to_blocks.get(request_id) else 1
+        if self.req_to_blocks.get(request_id):
+            return 0
+        if self._transient_free is None:
+            return 1
+        if self._transient_free:
+            # From the transient pool: none of the shared pool's blocks.
+            return 0
+        # No ring free: more than the shared pool holds, so the request waits
+        # a step, as Mamba's does for a state another request is writing.
+        logger.warning_once(
+            "The transient pool has no free ring; requests wait for one. "
+            "Rings held: %d.",
+            len(self.req_to_blocks),
+        )
+        return self.block_pool.num_gpu_blocks + 1
+
+    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        blocks = super().pop_blocks_for_free(request_id)
+        if self._transient_free is None:
+            return blocks
+        for ring in blocks:
+            ring.ref_cnt = 0
+            self._transient_free.append(ring)
+        return []
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
@@ -1378,6 +1583,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # Mapping from request ID to the index of the block
             # allocated in the previous step
             self.last_state_block_idx: dict[str, int] = {}
+            self._num_retired_blocks: dict[str, int] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
             # Number of internal checkpoint blocks required by each request's
@@ -1388,6 +1594,41 @@ class MambaManager(SingleTypeKVCacheManager):
             # into a private cow_block; we record that block for connector
             # offload (see _pending_boundary_state_offloads).
             self._producer_partial_tail_reqs: dict[str, int] = {}
+            # CacheConfig.prefix_cache_decode_tail. Per decoding request: the
+            # tokens it was (re)scheduled with, known from its first
+            # cache_blocks (its prompt; on resuming from preemption, also the
+            # outputs it recomputes, whose steps are prefill), the boundary
+            # of its latest snapshot, the snapshot due this step, the snapshot
+            # allocated this step awaiting its key, and the keyed entry it
+            # keeps (retired when the next one is keyed).
+            self._decode_tail_prompt: dict[str, int] = {}
+            self._decode_tail_last: dict[str, int] = {}
+            self._decode_tail_due: dict[str, int] = {}
+            self._pending_decode_tails: dict[str, tuple[KVCacheBlock, int]] = {}
+            self._decode_tails: dict[
+                str, tuple[KVCacheBlock, BlockHashWithGroupId]
+            ] = {}
+            # decode_tail_mode "recover": per request, the snapshot block the
+            # worker writes the state into when a verify window crosses its
+            # boundary, and that boundary; the boundary due this step; and the
+            # targets to hand the worker (boundary 0 clears one). A target
+            # outstanding over a step without drafts is spoiled: that step runs
+            # no commit, so the boundary it may cross is never written; the
+            # block goes back unkeyed.
+            self._recover_tails: dict[str, tuple[KVCacheBlock, int]] = {}
+            self._recover_due: dict[str, int] = {}
+            self._recover_spoiled: set[str] = set()
+            self._tail_updates: dict[str, tuple[int, int]] = {}
+            # CacheConfig.prefix_cache_evict_superseded_first. Per request: the
+            # boundary up to which its states are never superseded (0 when it
+            # resumed a conversation of its own, else its prompt: a new
+            # conversation's prompt states may be its siblings'), and its
+            # latest cached state -- block, key, boundary -- which is where its
+            # conversation resumes until a later one is cached.
+            self._superseded_floor: dict[str, int] = {}
+            self._latest_states: dict[
+                str, tuple[KVCacheBlock, BlockHashWithGroupId, int]
+            ] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -1526,6 +1767,27 @@ class MambaManager(SingleTypeKVCacheManager):
 
         return mask
 
+    def _remove_blocks_in_range(
+        self, request_id: str, first_block: int, last_block: int
+    ) -> None:
+        if self.mamba_cache_mode != "align":
+            return super()._remove_blocks_in_range(request_id, first_block, last_block)
+        blocks = self.req_to_blocks.get(request_id, [])
+        first_block = max(first_block, self._num_retired_blocks.get(request_id, 0))
+        last_block = min(last_block, len(blocks))
+        if first_block >= last_block:
+            return
+        freed: list[KVCacheBlock] = []
+        # Mamba prefill leaves null gaps between states awaiting retirement.
+        for i in range(last_block - 1, first_block - 1, -1):
+            if blocks[i].is_null:
+                continue
+            freed.append(blocks[i])
+            blocks[i] = self._null_block
+        if freed:
+            self.block_pool.free_blocks(freed)
+        self._num_retired_blocks[request_id] = last_block
+
     def remove_skipped_blocks(
         self,
         request_id: str,
@@ -1562,6 +1824,70 @@ class MambaManager(SingleTypeKVCacheManager):
         """
         return 0
 
+    def add_local_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        super().add_local_computed_blocks(
+            request_id,
+            new_computed_blocks,
+            num_local_computed_tokens,
+            num_external_computed_tokens,
+        )
+        if self.evict_superseded_first and self.mamba_cache_mode == "align":
+            # The state the request resumes from is its conversation's latest
+            # until the request caches a later one.
+            hit = next(
+                (b for b in reversed(new_computed_blocks) if not b.is_null), None
+            )
+            if hit is not None and hit.block_hash is not None:
+                self._latest_states[request_id] = (
+                    hit,
+                    hit.block_hash,
+                    num_local_computed_tokens,
+                )
+
+    def _note_cached_state(
+        self,
+        request_id: str,
+        block: KVCacheBlock,
+        block_hash: BlockHashWithGroupId | None,
+        boundary: int,
+    ) -> None:
+        """A state of the request is cached at ``boundary``
+        (``CacheConfig.prefix_cache_evict_superseded_first``). The later of it
+        and the request's latest so far is where its conversation now
+        resumes; the earlier is superseded."""
+        if not self.evict_superseded_first or block_hash is None:
+            return
+        entry = (block, block_hash, boundary)
+        latest = self._latest_states.get(request_id)
+        if latest is None or boundary > latest[2]:
+            self._latest_states[request_id] = entry
+            if latest is not None:
+                self._supersede_state(request_id, latest)
+        elif boundary < latest[2]:
+            self._supersede_state(request_id, entry)
+
+    def _supersede_state(
+        self,
+        request_id: str,
+        state: tuple[KVCacheBlock, BlockHashWithGroupId, int],
+    ) -> None:
+        """Send a superseded state to the eviction end -- unless it is in a new
+        conversation's prompt (its siblings' too, perhaps) or ends a prefix
+        another running request holds."""
+        block, block_hash, boundary = state
+        floor = self._superseded_floor.get(request_id)
+        if floor is None or boundary <= floor:
+            return
+        if self._prefix_shared(request_id, boundary):
+            return
+        self.block_pool.supersede_cached_block(block, block_hash)
+
     def _needs_internal_checkpoint(
         self,
         request_id: str,
@@ -1588,8 +1914,10 @@ class MambaManager(SingleTypeKVCacheManager):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        read_only: bool = False,
     ) -> int:
         assert isinstance(self.kv_cache_spec, MambaSpec)
+        record = not (apply_admission_cap or read_only)
         if (
             len(new_computed_blocks) > 0
             and new_computed_blocks[-1].block_hash in self.cached_blocks_this_step
@@ -1614,6 +1942,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_local_computed_tokens,
                 num_tokens_main_model,
                 apply_admission_cap=apply_admission_cap,
+                read_only=read_only,
             )
         else:
             # We don't allocate blocks for lookahead tokens in align mode, because if
@@ -1646,7 +1975,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     request_id, num_tokens, total_computed_tokens
                 )
             )
-            if not apply_admission_cap:
+            if record:
                 self._num_checkpoint_blocks[request_id] = checkpoint_block
             if num_new_blocks > 0:
                 num_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
@@ -1656,7 +1985,201 @@ class MambaManager(SingleTypeKVCacheManager):
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
             )
-            return num_new_blocks + num_evictable_computed_blocks
+            decode_tail = self._decode_tail_due_at(
+                request_id, total_computed_tokens, num_tokens
+            )
+            recover_tail = self._recover_tail_due_at(
+                request_id, total_computed_tokens, num_tokens
+            )
+            if record:
+                if decode_tail is not None:
+                    self._decode_tail_due[request_id] = decode_tail
+                else:
+                    self._decode_tail_due.pop(request_id, None)
+                if recover_tail is not None:
+                    self._recover_due[request_id] = recover_tail
+                else:
+                    self._recover_due.pop(request_id, None)
+                if (
+                    request_id in self._recover_tails
+                    and num_tokens - total_computed_tokens < 2
+                ):
+                    self._recover_spoiled.add(request_id)
+            return (
+                num_new_blocks
+                + num_evictable_computed_blocks
+                + int(decode_tail is not None)
+                + int(recover_tail is not None)
+            )
+
+    def _decode_tail_due_at(
+        self, request_id: str, num_computed_tokens: int, num_tokens: int
+    ) -> int | None:
+        """The boundary whose running state this step must snapshot before
+        its forward moves it on (``CacheConfig.prefix_cache_decode_tail``),
+        or None. Only a request already decoding: one allocated before, with
+        no copy-on-write of its own pending this step (the snapshot copies the
+        running block, which such a copy is still filling), and no lookahead
+        (under speculative decoding the running state after a step sits at
+        the accepted position, which the scheduler cannot name in advance)."""
+        if self.decode_tail_unit is None or self.decode_tail_mode != "copy":
+            return None
+        prompt = self._decode_tail_prompt.get(request_id)
+        if (
+            prompt is None
+            or num_computed_tokens <= prompt
+            or num_computed_tokens % self.decode_tail_unit != 0
+            or num_computed_tokens % self.block_size == 0
+            or num_tokens != num_computed_tokens + 1
+            or self.num_speculative_blocks > 0
+            or request_id not in self._allocated_block_reqs
+            or request_id in self._partial_hit_reqs
+            or self._decode_tail_last.get(request_id) == num_computed_tokens
+        ):
+            return None
+        return num_computed_tokens
+
+    def _recover_tail_due_at(
+        self, request_id: str, num_computed_tokens: int, num_tokens: int
+    ) -> int | None:
+        """Under decode_tail_mode "recover", the boundary this step's verify
+        window may cross and which needs a snapshot block, or None: the next
+        unit boundary past the tokens already scheduled (so no step in flight
+        can cross it before the target reaches the worker), past the tokens
+        the request was (re)scheduled with, inside a block (a block
+        boundary's state the commit already keeps), and no further than this
+        step's last token. Only a verify step, with drafts: past those tokens
+        every step is a decode, one token and its drafts, and only a verify
+        runs the RecoverSSM commit that writes the target. A request with a
+        target outstanding keeps it until its committed tokens pass it."""
+        if self.decode_tail_unit is None or self.decode_tail_mode != "recover":
+            return None
+        prompt = self._decode_tail_prompt.get(request_id)
+        if (
+            prompt is None
+            or num_computed_tokens < prompt
+            or num_tokens - num_computed_tokens < 2
+            or request_id in self._recover_tails
+            or request_id not in self._allocated_block_reqs
+            or request_id in self._partial_hit_reqs
+        ):
+            return None
+        unit = self.decode_tail_unit
+        boundary = (num_computed_tokens // unit + 1) * unit
+        if boundary % self.block_size == 0:
+            boundary += unit
+        if boundary <= prompt or boundary > num_tokens:
+            return None
+        return boundary
+
+    def _target_recover_tail(self, request_id: str, boundary: int) -> None:
+        """Take a snapshot block for ``boundary`` and hand it to the worker,
+        whose RecoverSSM commit writes the state there when the step that
+        crosses the boundary commits. Held until the committed tokens pass
+        the boundary, then keyed; or freed with the request."""
+        snapshot = self.block_pool.get_new_blocks(1)[0]
+        self._recover_tails[request_id] = (snapshot, boundary)
+        self._tail_updates[request_id] = (boundary, snapshot.block_id)
+
+    def _key_recover_tail(self, request: Request) -> None:
+        """Once the request's committed tokens have passed its target, the
+        commit that crossed it has written the snapshot: key it at the
+        boundary, retire the previous decode tail, and let the block go idle
+        (cached); a spoiled one goes back unkeyed. The worker's target is
+        cleared."""
+        target = self._recover_tails.get(request.request_id)
+        if target is None:
+            return
+        snapshot, boundary = target
+        committed = request.num_computed_tokens - request.num_in_flight_tokens
+        if committed < boundary:
+            return
+        del self._recover_tails[request.request_id]
+        self._tail_updates[request.request_id] = (0, 0)
+        assert self.decode_tail_unit is not None
+        key = None
+        spoiled = request.request_id in self._recover_spoiled
+        self._recover_spoiled.discard(request.request_id)
+        if (
+            not spoiled
+            and len(request.block_hashes) >= boundary // self.decode_tail_unit
+        ):
+            key = self.block_pool.cache_partial_block(
+                request=request,
+                block=snapshot,
+                num_tokens=boundary,
+                kv_cache_group_id=self.kv_cache_group_id,
+                block_size=self.block_size,
+            )
+        if key is not None:
+            previous = self._decode_tails.get(request.request_id)
+            if previous is not None:
+                self.block_pool.retire_cached_block(*previous)
+            self._decode_tails[request.request_id] = (snapshot, key)
+            self._note_cached_state(request.request_id, snapshot, key, boundary)
+        self.block_pool.free_blocks([snapshot])
+
+    def take_decode_tail_updates(self) -> dict[str, tuple[int, int]]:
+        if self.mamba_cache_mode != "align":
+            return {}
+        updates = self._tail_updates
+        self._tail_updates = {}
+        return updates
+
+    def context_thread_blocks(
+        self, request_id: str
+    ) -> list[tuple[KVCacheBlock, BlockHashWithGroupId]]:
+        if self.mamba_cache_mode != "align":
+            return []
+        tail = self._decode_tails.get(request_id)
+        return [tail] if tail is not None else []
+
+    def _snapshot_decode_tail(self, request_id: str, boundary: int) -> None:
+        """Queue a copy of the running state at ``boundary`` into a block of
+        its own. The copy runs before this step's forward; ``cache_blocks``
+        keys the block right after this allocation. Both copy endpoints stay
+        retained until the copy has run -- the snapshot by the ref it is
+        allocated with, the running block by one more -- after which the
+        snapshot is an idle cached block like any other."""
+        blocks = self.req_to_blocks[request_id]
+        block_idx = boundary // self.block_size
+        if block_idx != len(blocks) - 1 or blocks[block_idx].is_null:
+            return  # not where a decoding request keeps its running state
+        running = blocks[block_idx]
+        snapshot = self.block_pool.get_new_blocks(1)[0]
+        running.ref_cnt += 1
+        self._pending_cow_copies.append((running, snapshot))
+        self._pending_decode_tails[request_id] = (snapshot, boundary)
+        self._decode_tail_last[request_id] = boundary
+
+    def _key_decode_tail(self, request: Request) -> None:
+        """Key this step's snapshot and retire the request's previous one:
+        a follow-up request extends the whole reply, so only the latest
+        boundary is worth a block."""
+        pending = self._pending_decode_tails.pop(request.request_id, None)
+        if pending is None:
+            return
+        snapshot, boundary = pending
+        assert self.decode_tail_unit is not None
+        if len(request.block_hashes) < boundary // self.decode_tail_unit:
+            # Not keyable yet; the snapshot goes back unkeyed after its copy.
+            return
+        key = self.block_pool.cache_partial_block(
+            request=request,
+            block=snapshot,
+            num_tokens=boundary,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_size=self.block_size,
+        )
+        if key is None:
+            return
+        # The copy that fills it runs with this step: defer same-step hits.
+        self.cached_blocks_this_step.add(key)
+        previous = self._decode_tails.get(request.request_id)
+        if previous is not None:
+            self.block_pool.retire_cached_block(*previous)
+        self._decode_tails[request.request_id] = (snapshot, key)
+        self._note_cached_state(request.request_id, snapshot, key, boundary)
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
@@ -1677,6 +2200,12 @@ class MambaManager(SingleTypeKVCacheManager):
             # We can ignore lookahead tokens because current draft models don't have
             # mamba layers.
             num_tokens = num_tokens_main_model
+            decode_tail = self._decode_tail_due.pop(request_id, None)
+            if decode_tail is not None:
+                self._snapshot_decode_tail(request_id, decode_tail)
+            recover_tail = self._recover_due.pop(request_id, None)
+            if recover_tail is not None:
+                self._target_recover_tail(request_id, recover_tail)
             req_blocks: list[KVCacheBlock] = self.req_to_blocks[request_id]
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
@@ -1754,6 +2283,13 @@ class MambaManager(SingleTypeKVCacheManager):
                             request_id, None
                         )
                         if boundary_tokens is not None:
+                            self._note_cached_state(
+                                request_id,
+                                cow_block,
+                                cow_block.block_hash,
+                                boundary_tokens,
+                            )
+                        if boundary_tokens is not None:
                             # This CoW preserved a producer's own boundary
                             # state in cow_block; hand it to the connector for
                             # partial-tail offload once the copy has run.
@@ -1790,11 +2326,34 @@ class MambaManager(SingleTypeKVCacheManager):
         req_blocks[block_idx] = self._null_block
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        recover_block: KVCacheBlock | None = None
         if self.mamba_cache_mode == "align":
+            # A "recover" target not yet crossed: its block goes back with the
+            # request's own, unkeyed, after any step still in flight (which
+            # may yet write into it) has run. The worker drops the target with
+            # the request.
+            target = self._recover_tails.pop(request_id, None)
+            if target is not None:
+                recover_block = target[0]
+            self._recover_due.pop(request_id, None)
+            self._recover_spoiled.discard(request_id)
+            self._tail_updates.pop(request_id, None)
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
+            self._num_retired_blocks.pop(request_id, None)
             self._num_checkpoint_blocks.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
+            # The request's decode tail stays cached for its follow-up; a
+            # snapshot not yet keyed goes back unkeyed once its copy has run.
+            self._decode_tail_prompt.pop(request_id, None)
+            self._decode_tail_last.pop(request_id, None)
+            self._decode_tail_due.pop(request_id, None)
+            self._pending_decode_tails.pop(request_id, None)
+            self._decode_tails.pop(request_id, None)
+            # The request's latest state stays cached in its place: its
+            # conversation resumes there.
+            self._superseded_floor.pop(request_id, None)
+            self._latest_states.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
             # the pool now, so drop its not-yet-offered hand-offs rather than
@@ -1805,7 +2364,10 @@ class MambaManager(SingleTypeKVCacheManager):
                 for entry in self._pending_boundary_state_offloads
                 if entry[0] != request_id
             ]
-        return super().pop_blocks_for_free(request_id)
+        blocks = super().pop_blocks_for_free(request_id)
+        if recover_block is not None:
+            blocks = [*blocks, recover_block]
+        return blocks
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
@@ -1825,9 +2387,31 @@ class MambaManager(SingleTypeKVCacheManager):
         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
+            if self.evict_superseded_first:
+                self._superseded_floor.setdefault(
+                    request.request_id,
+                    0
+                    if self._resumed_own.get(request.request_id)
+                    else request.num_prompt_tokens,
+                )
+                blocks = self.req_to_blocks[request.request_id]
+                for idx in range(num_cached_blocks_before, num_cached_blocks_after):
+                    if not blocks[idx].is_null:
+                        self._note_cached_state(
+                            request.request_id,
+                            blocks[idx],
+                            blocks[idx].block_hash,
+                            (idx + 1) * self.block_size,
+                        )
             partial_hash = self._cache_partial_tail_block(request, num_tokens)
             if partial_hash is not None:
                 self.cached_blocks_this_step.add(partial_hash)
+            if self.decode_tail_unit is not None:
+                self._decode_tail_prompt.setdefault(
+                    request.request_id, request.num_tokens
+                )
+                self._key_decode_tail(request)
+                self._key_recover_tail(request)
         if num_cached_blocks_after > num_cached_blocks_before:
             blocks = self.req_to_blocks[request.request_id]
             for idx in range(num_cached_blocks_before, num_cached_blocks_after):
@@ -1988,10 +2572,20 @@ class SinkFullAttentionManager(FullAttentionManager):
         self.sink_blocks = self.block_pool.free_block_queue.popleft_n(num_sink_block)
 
 
+def transient_ring_free_list(num_transient_blocks: int) -> list[KVCacheBlock]:
+    """The transient pool's free rings, for the managers of every transient
+    group to share; block 0 is held back as the pool's null block (a padded
+    batch row's block table reads 0)."""
+    return [
+        KVCacheBlock(block_id) for block_id in range(num_transient_blocks - 1, 0, -1)
+    ]
+
+
 def get_manager_for_kv_cache_spec(
     kv_cache_spec: KVCacheSpec,
     max_in_flight_tokens: int,
     max_model_len: int,
+    transient_free: list[KVCacheBlock] | None = None,
     **kwargs,
 ) -> SingleTypeKVCacheManager:
     """
@@ -2006,6 +2600,9 @@ def get_manager_for_kv_cache_spec(
         max_in_flight_tokens: The max tokens scheduled but not yet settled
             (one batch per concurrent step); see `VllmConfig.max_in_flight_tokens`
         max_model_len: The maximum context length the model could serve
+        transient_free: For a group in the transient pool, the pool's free
+            rings, one list for every transient group
+            (`transient_ring_free_list`); None otherwise.
     Returns:
         An instance of the appropriate SingleTypeKVCacheManager subclass
     """
@@ -2013,6 +2610,11 @@ def get_manager_for_kv_cache_spec(
     assert manager_class is not None, (
         f"No manager registered for KVCacheSpec {type(kv_cache_spec)}"
     )
+    if transient_free is not None:
+        assert issubclass(manager_class, CircularBufferManager), (
+            f"{manager_class.__name__} cannot take a transient pool"
+        )
+        kwargs["transient_free"] = transient_free
     # SlidingWindow / ChunkedLocalAttention managers recycle blocks;
     # the runtime admission cap must match the recycling-aware bound the
     # startup pool sizer uses (single source of truth: the spec method).

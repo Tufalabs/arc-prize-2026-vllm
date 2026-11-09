@@ -22,6 +22,10 @@ from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
+from vllm.v1.worker.gpu.spec_decode.sparse_sampler import (
+    SparseDraftState,
+    sparse_rejection_sample,
+)
 
 # Cap on the FP32 target-logits buffer materialized by apply_sampling_params.
 # TODO(mgoin): Chunking is a workaround. The rejection kernels already upcast
@@ -96,6 +100,19 @@ class RejectionSampler:
             )
         elif rejection_sample_method == "block":
             self.use_block_verification = True
+        self.accept_threshold_single = spec_config.accept_threshold_single
+        self.accept_threshold_acc = spec_config.accept_threshold_acc
+        # XKB_SPARSE_SAMPLER: the speculator's compact draft cache (set by the
+        # model runner), used for standard rejection sampling of batches
+        # without logprobs; other batches get the full cache rebuilt.
+        self.sparse: SparseDraftState | None = None
+        self.sparse_modes_ok = (
+            self.synthetic_conditional_rates is None
+            and not self.use_block_verification
+            and self.accept_threshold_single >= 1.0
+            and self.accept_threshold_acc >= 1.0
+            and not self.enable_adaptive_verification
+        )
 
     def _get_logprobs_tensors(
         self,
@@ -152,7 +169,11 @@ class RejectionSampler:
         idx_mapping_np: np.ndarray,
         expanded_idx_mapping: torch.Tensor,
         expanded_local_pos: torch.Tensor,
+        no_logprobs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        sparse = self.sparse if draft_logits is not None else None
+        if sparse is not None and no_logprobs and self.sparse_modes_ok:
+            self.sampler.fold_cand = sparse.list_size
         processed_logits = self.sampler.apply_sampling_params(
             logits,
             expanded_idx_mapping,
@@ -162,6 +183,34 @@ class RejectionSampler:
             draft_sampled,
             expanded_local_pos,
         )
+        self.sampler.fold_cand = 0
+        # The sampler's top-k fold may have written the target's tile
+        # statistics (XKB_SAMPLER_FOLD=2).
+        target_stats = self.sampler.fused_target_stats
+        self.sampler.fused_target_stats = None
+        cand = self.sampler.fused_target_cand
+        self.sampler.fused_target_cand = None
+        if cand is not None:
+            assert sparse is not None and target_stats is not None
+            sampled, num_sampled = sparse_rejection_sample(
+                cand,
+                processed_logits,
+                target_stats,
+                sparse.cache,
+                sparse.cache_lse,
+                sparse.t2d,
+                draft_sampled,
+                cu_num_logits,
+                pos,
+                idx_mapping,
+                self.sampler.sampling_states.temperature.gpu,
+                self.sampler.sampling_states.seeds.gpu,
+                self.num_speculative_steps,
+                target_stats_complete=False,
+            )
+            return processed_logits, sampled, num_sampled
+        if sparse is not None:
+            sparse.expand()
         sampled, num_sampled = rejection_sample(
             processed_logits,
             draft_logits,
@@ -177,6 +226,9 @@ class RejectionSampler:
             self.synthetic_conditional_rates,
             use_fp64=self.sampler.use_fp64_gumbel,
             use_block_verification=self.use_block_verification,
+            accept_threshold_single=self.accept_threshold_single,
+            accept_threshold_acc=self.accept_threshold_acc,
+            target_stats=target_stats,
         )
         return processed_logits, sampled, num_sampled
 
@@ -224,6 +276,7 @@ class RejectionSampler:
                 input_batch.idx_mapping_np[start:end],
                 input_batch.expanded_idx_mapping[lo:hi],
                 input_batch.expanded_local_pos[lo:hi],
+                no_logprobs=max_num_logprobs == NO_LOGPROBS,
             )
             chunk_logprobs = self._get_logprobs_tensors(
                 sampled,

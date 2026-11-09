@@ -43,6 +43,7 @@ from vllm.config import (
     DiffusionConfig,
     ECTransferConfig,
     EncoderCacheManagerConfig,
+    EngramConfig,
     EPLBConfig,
     FaultToleranceConfig,
     KernelConfig,
@@ -726,6 +727,7 @@ class EngineArgs:
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
     attention_config: AttentionConfig = get_field(VllmConfig, "attention_config")
+    engram_config: EngramConfig | None = VllmConfig.engram_config
     mamba_config: MambaConfig = get_field(VllmConfig, "mamba_config")
     kernel_config: KernelConfig = get_field(VllmConfig, "kernel_config")
     enable_flashinfer_autotune: bool = get_field(
@@ -762,6 +764,12 @@ class EngineArgs:
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
     prefix_match_unit: int | None = get_field(CacheConfig, "prefix_match_unit")
+    prefix_cache_decode_tail: bool = CacheConfig.prefix_cache_decode_tail
+    transient_kv_pool: bool = CacheConfig.transient_kv_pool
+    prefix_cache_evict_superseded_first: bool = (
+        CacheConfig.prefix_cache_evict_superseded_first
+    )
+    prefix_cache_context_threads: bool = CacheConfig.prefix_cache_context_threads
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
     replayssm_buffer_len: int = CacheConfig.replayssm_buffer_len
     use_replayssm: bool = CacheConfig.use_replayssm
@@ -819,6 +827,8 @@ class EngineArgs:
             self.compilation_config = CompilationConfig(**self.compilation_config)
         if isinstance(self.attention_config, dict):
             self.attention_config = AttentionConfig(**self.attention_config)
+        if isinstance(self.engram_config, dict):
+            self.engram_config = EngramConfig(**self.engram_config)
         if isinstance(self.mamba_config, dict):
             self.mamba_config = MambaConfig(**self.mamba_config)
         if isinstance(self.kernel_config, dict):
@@ -1314,6 +1324,20 @@ class EngineArgs:
             "--prefix-match-unit", **cache_kwargs["prefix_match_unit"]
         )
         cache_group.add_argument(
+            "--prefix-cache-decode-tail", **cache_kwargs["prefix_cache_decode_tail"]
+        )
+        cache_group.add_argument(
+            "--transient-kv-pool", **cache_kwargs["transient_kv_pool"]
+        )
+        cache_group.add_argument(
+            "--prefix-cache-evict-superseded-first",
+            **cache_kwargs["prefix_cache_evict_superseded_first"],
+        )
+        cache_group.add_argument(
+            "--prefix-cache-context-threads",
+            **cache_kwargs["prefix_cache_context_threads"],
+        )
+        cache_group.add_argument(
             "--mamba-cache-mode", **cache_kwargs["mamba_cache_mode"]
         )
         cache_group.add_argument(
@@ -1723,6 +1747,7 @@ class EngineArgs:
         vllm_group.add_argument(
             "--attention-config", "-ac", **vllm_kwargs["attention_config"]
         )
+        vllm_group.add_argument("--engram-config", **vllm_kwargs["engram_config"])
         vllm_group.add_argument("--reasoning-config", **vllm_kwargs["reasoning_config"])
         vllm_group.add_argument("--kernel-config", **vllm_kwargs["kernel_config"])
         vllm_group.add_argument(
@@ -2103,6 +2128,12 @@ class EngineArgs:
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
             prefix_match_unit=self.prefix_match_unit,
+            prefix_cache_decode_tail=self.prefix_cache_decode_tail,
+            transient_kv_pool=self.transient_kv_pool,
+            prefix_cache_evict_superseded_first=(
+                self.prefix_cache_evict_superseded_first
+            ),
+            prefix_cache_context_threads=self.prefix_cache_context_threads,
             mamba_cache_mode=self.mamba_cache_mode,
             replayssm_buffer_len=self.replayssm_buffer_len,
             use_replayssm=self.use_replayssm,
@@ -2623,6 +2654,7 @@ class EngineArgs:
             load_config=load_config,
             offload_config=offload_config,
             attention_config=attention_config,
+            engram_config=self.engram_config,
             mamba_config=mamba_config,
             kernel_config=kernel_config,
             lora_config=lora_config,

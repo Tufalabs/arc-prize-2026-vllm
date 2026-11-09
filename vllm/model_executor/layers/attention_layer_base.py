@@ -43,3 +43,12 @@ class AttentionLayerBase(ABC):
         May be None if the layer does not need KV cache.
         """
         pass
+
+    def kv_bytes_per_token(self, vllm_config: VllmConfig) -> int | None:
+        """Bytes one token takes in a KV block across every cache this layer
+        puts there, for the hybrid block alignment
+        (``Platform._align_hybrid_block_size``). None, the default, leaves the
+        alignment to size a token from the attention backend's spec; a layer
+        whose caches that spec does not describe says it here."""
+        del vllm_config
+        return None

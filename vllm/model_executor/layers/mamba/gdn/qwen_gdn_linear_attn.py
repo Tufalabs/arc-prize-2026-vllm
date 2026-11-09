@@ -12,6 +12,7 @@ from torch import nn
 from vllm import _custom_ops as ops
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
@@ -31,12 +32,19 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
+    GDN_FP8_STATE,
+    MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
+)
+from vllm.model_executor.layers.mamba.ops.gdn_fp8_state import (
+    gather_fp8_states,
+    is_fp8_state,
+    scatter_fp8_states_,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
@@ -78,16 +86,211 @@ GDN_AITER_TRITON_AVAILABLE = (
 
 if GDN_AITER_TRITON_AVAILABLE:
     from aiter.ops.triton.causal_conv1d_update_single_token import (
-        fused_reshape_causal_conv1d_update_single_token as gdn_aiter_fused_reshape_causal_conv1d_update_single_token,  # noqa: E501
+        fused_reshape_causal_conv1d_update_single_token as gdn_aiter_fused_reshape_causal_conv1d_update_single_token,  # noqa: E501  # noqa: E501
     )
     from aiter.ops.triton.gated_delta_net.fused_rearrange_sigmoid_gdr import (
-        fused_rearrange_sigmoid_gated_delta_rule as gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule,  # noqa: E501
+        fused_rearrange_sigmoid_gated_delta_rule as gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule,  # noqa: E501  # noqa: E501
     )
 
 logger = init_logger(__name__)
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
+
+# XKB_GDN_NOCOPY=1 drops two ATen copies a GDN layer and keeps every result bit.
+# The RecoverSSM verify reads q, k and v as views of the convolution output (its
+# kernels take token strides), instead of rearrange_mixed_qkv's three copies and cat.
+# The gated norm reads z in place from the projection (_norm_gated_heads) instead of
+# z.reshape's copy.
+XKB_GDN_NOCOPY = os.environ.get("XKB_GDN_NOCOPY", "0") == "1"
+
+# XKB_GDN_MIX=1: in a batch of RecoverSSM verifies and prefill chunks whose verify
+# tokens lead (the builder's xkb_spec_prefix), _forward_core takes both parts as row
+# slices instead of index_select copies.
+# The verify and the chunk kernel write their outputs into core_attn_out in place, so
+# the merge (an empty buffer, two index_copy_ and a copy) goes away, and b and a keep
+# their row stride as in a verify-only batch.
+# XKB_GDN_MIX=2 also calls FLA's chunk_gated_delta_rule_fwd directly on that path,
+# without the autograd Function, input_guard and custom_fwd around it (its inputs are
+# contiguous there).
+# Every result keeps its bits: the kernels read the same values through their stride
+# arguments.
+XKB_GDN_MIX = int(os.environ.get("XKB_GDN_MIX", "0") or 0)
+XKB_GDN_MIX_COUNTS = {"sliced": 0, "lean_chunk": 0}
+
+
+def _xkb_all_contiguous(*tensors: torch.Tensor | None) -> bool:
+    return all(t is not None and t.is_contiguous() for t in tensors)
+
+
+def _xkb_lean_chunk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
+    chunk_offsets: torch.Tensor,
+    core_attn_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FLA's chunk_gated_delta_rule for inference, as ChunkGatedDeltaRuleFunction runs
+    it, without its wrappers.
+
+    The callers' tensors are contiguous on the current device, which is what
+    input_guard makes sure of, and inference runs no autocast, so custom_fwd and the
+    autograd Function only add host time.
+    """
+    from vllm.third_party.flash_linear_attention.ops.chunk import (
+        chunk_gated_delta_rule_fwd,
+    )
+
+    _, o, _, final_state, _, _, _ = chunk_gated_delta_rule_fwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=k.shape[-1] ** -0.5,
+        initial_state=initial_state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        core_attn_out=core_attn_out,
+    )
+    return o, final_state
+
+
+@triton.jit
+def _xkb_gated_rmsnorm_heads_kernel(
+    X,
+    Y,
+    W,
+    Z,
+    stride_x_row,
+    stride_y_row,
+    stride_z_token,
+    stride_z_head,
+    M,
+    H,
+    N: tl.constexpr,
+    eps,
+    BLOCK_N: tl.constexpr,
+    ROWS_PER_BLOCK: tl.constexpr,
+    NORM_BEFORE_GATE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+):
+    # layer_norm_fwd_kernel's statements for IS_RMS_NORM, HAS_Z, no bias and one
+    # group, in the same order, over rows (token, head) of x.
+    # Only z's row address differs: token * stride_z_token + head * stride_z_head,
+    # so z can be a view of the projection; rstd is not stored.
+    row_start = tl.program_id(0) * ROWS_PER_BLOCK
+    rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
+    cols = tl.arange(0, BLOCK_N)
+    row_offsets = rows[:, None] * stride_x_row
+    col_offsets = cols[None, :]
+    X_base = X + row_offsets + col_offsets
+    Y_base = Y + rows[:, None] * stride_y_row + col_offsets
+    Z_base = (
+        Z
+        + (rows // H)[:, None] * stride_z_token
+        + (rows % H)[:, None] * stride_z_head
+        + col_offsets
+    )
+    row_mask = rows[:, None] < M
+    col_mask = cols[None, :] < N
+    mask = row_mask & col_mask
+    x = tl.load(X_base, mask=mask, other=0.0).to(tl.float32)
+    if not NORM_BEFORE_GATE:
+        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+        if ACTIVATION == "swish" or ACTIVATION == "silu":
+            x *= z * tl.sigmoid(z)
+        elif ACTIVATION == "sigmoid":
+            x *= tl.sigmoid(z)
+    xbar = tl.where(mask, x, 0.0)
+    var = tl.sum(xbar * xbar, axis=1) / N
+    rstd = tl.rsqrt(var + eps)
+    w_mask = cols < N
+    w = tl.load(W + cols, mask=w_mask, other=0.0).to(tl.float32)
+    x_hat = x * rstd[:, None]
+    y = x_hat * w[None, :]
+    if NORM_BEFORE_GATE:
+        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+        if ACTIVATION == "swish" or ACTIVATION == "silu":
+            y *= z * tl.sigmoid(z)
+        elif ACTIVATION == "sigmoid":
+            y *= tl.sigmoid(z)
+    tl.store(Y_base, y, mask=mask)
+
+
+def _norm_gated_heads(
+    norm: RMSNormGated,
+    x: torch.Tensor,
+    z: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """The FLA gated RMS norm of heads x [T, H, D] with gate z [T, H, D] a strided view
+    (the projection's z columns), without copying z.
+
+    Launches _xkb_gated_rmsnorm_heads_kernel with the grid, row blocks, tile and
+    warps layer_norm_fwd uses for x.reshape(-1, D) and z.reshape(-1, D), so each row
+    is the same code over the same values. out=None: returns a new [T, H * D]
+    tensor, standing for self.norm(x, z) in _output_projection, only for a norm
+    dispatched to forward_cuda (whose forward is that layer_norm_fwd call). out
+    given ([T, H, D], contiguous, may be x): writes the result there and returns it,
+    standing for _rms_norm_gated_cuda's layer_norm_fwd call. Returns None when the
+    reshaped call has to run: z contiguous (its reshape copies nothing) or another
+    norm configuration.
+    """
+    if (
+        z.dim() != 3
+        or x.shape != z.shape
+        or z.is_contiguous()
+        or not x.is_contiguous()
+        or z.stride(-1) != 1
+        or z.shape[0] == 0
+        or not x.is_cuda
+        or norm.bias is not None
+        or norm.group_size is not None
+        or tuple(norm.weight.shape) != (z.shape[-1],)
+        or not norm.weight.is_contiguous()
+        or (out is None and norm._forward_method != norm.forward_cuda)
+        or (out is not None and (out.shape != x.shape or not out.is_contiguous()))
+    ):
+        return None
+    from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
+        calc_rows_per_block,
+    )
+
+    T, H, D = z.shape
+    block_n = min(65536 // x.element_size(), triton.next_power_of_2(D))
+    if block_n < D:
+        return None
+    x2 = x.view(T * H, D)
+    y = torch.empty_like(x2) if out is None else out.view(T * H, D)
+    rows_per_block = calc_rows_per_block(T * H, x.device)
+    _xkb_gated_rmsnorm_heads_kernel[(triton.cdiv(T * H, rows_per_block),)](
+        x2,
+        y,
+        norm.weight,
+        z,
+        x2.stride(0),
+        y.stride(0),
+        z.stride(0),
+        z.stride(1),
+        T * H,
+        H,
+        D,
+        norm.eps,
+        BLOCK_N=block_n,
+        ROWS_PER_BLOCK=rows_per_block,
+        NORM_BEFORE_GATE=norm.norm_before_gate,
+        ACTIVATION=norm.activation,
+        num_warps=min(max(block_n // 256, 1), 8),
+    )
+    return y.view(T, H * D) if out is None else out
 
 
 def _resolve_gdn_prefill_backend(
@@ -361,8 +564,8 @@ class ChunkGatedDeltaRule(CustomOp):
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_state_shape(
         self,
-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+    ) -> tuple[tuple[int, ...], ...]:
+        base_shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             self.tp_size,
             self.num_k_heads,
             self.num_v_heads,
@@ -370,7 +573,31 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.head_v_dim,
             self.conv_kernel_size,
             self.num_spec,
+            fp8_state=self.cache_config.mamba_ssm_cache_dtype == GDN_FP8_STATE,
         )
+        if self.cache_config.use_gdn_recoverssm:
+            return MambaStateShapeCalculator.append_gdn_recoverssm_record(
+                base_shapes,
+                self.tp_size,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                spec_query_len=1 + self.num_spec,
+            )
+        return base_shapes
+
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        # The CUDA path's kernels read and write an FP8 state (gdn_fp8_state).
+        base_dtypes = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            self.cache_config.mamba_ssm_cache_dtype,
+            allow_fp8_state=True,
+        )
+        if self.cache_config.use_gdn_recoverssm:
+            return MambaStateDtypeCalculator.append_gdn_recoverssm_record(base_dtypes)
+        return base_dtypes
 
     def __init__(
         self,
@@ -494,6 +721,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.out_proj",
         )
 
+        self.use_recoverssm = self.cache_config.use_gdn_recoverssm
+        self.fp8_state = self.cache_config.mamba_ssm_cache_dtype == GDN_FP8_STATE
+        if self.fp8_state and not current_platform.is_cuda():
+            raise ValueError(
+                "The FP8 GDN recurrent state (mamba_ssm_cache_dtype="
+                f"{GDN_FP8_STATE!r}) has CUDA kernels only"
+            )
+        self.spec_query_len = 1 + self.num_spec
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
         self._prefill_kernels_warmed_up = False
@@ -526,7 +761,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _fused_gdn_decode_unsupported_reason(
         self, vllm_config: VllmConfig
     ) -> str | None:
-        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()
+        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()[:2]
         if (
             self.gqa_interleaved_layout
             or self.head_k_dim != 128
@@ -825,6 +1060,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         return query, key, value
 
+    def mixed_qkv_views(self, mixed_qkv):
+        """rearrange_mixed_qkv without its copies (XKB_GDN_NOCOPY).
+
+        Returns (1, seq, heads, dim) views of mixed_qkv that keep its token stride,
+        for kernels that take one, such as gdn_recoverssm_verify.
+        """
+        q_dim = self.key_dim // self.tp_size
+        v_dim = self.value_dim // self.tp_size
+        query, key, value = torch.split(mixed_qkv, [q_dim, q_dim, v_dim], dim=-1)
+        return (
+            query.unflatten(-1, (-1, self.head_k_dim)).unsqueeze(0),
+            key.unflatten(-1, (-1, self.head_k_dim)).unsqueeze(0),
+            value.unflatten(-1, (-1, self.head_v_dim)).unsqueeze(0),
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -841,6 +1091,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         The RMSNormGated + quant sequence is eligible for fusion
         by the compilation pass when fuse_norm_quant is enabled.
         """
+        if XKB_GDN_NOCOPY:
+            normed = _norm_gated_heads(self.norm, core_attn_out, z)
+            if normed is not None:
+                output, _ = self.out_proj(normed)
+                return output
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
@@ -1096,7 +1351,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         dtype = qkv_or_qkvz.dtype
         num_k_heads = self.num_k_heads // self.tp_size
         num_v_heads = self.num_v_heads // self.tp_size
-        _, state_dtype = self.get_state_dtype()
+        state_dtype = self.get_state_dtype()[1]
+        if self.fp8_state:
+            # Prefill reads an FP8 state dequantized (gather_fp8_states).
+            state_dtype = torch.float32
 
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
         # is sufficient to populate every autotuner cache. Mirror the real
@@ -1326,12 +1584,30 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
 
+        # XKB_GDN_MIX: the verify tokens are the batch's first spec_prefix
+        # tokens and the chunk tokens follow them.
+        spec_prefix = getattr(attn_metadata, "xkb_spec_prefix", -1)
+        if spec_prefix >= 0:
+            non_spec_end = (
+                spec_prefix
+                + attn_metadata.num_prefill_tokens
+                + attn_metadata.num_decode_tokens
+            )
+            XKB_GDN_MIX_COUNTS["sliced"] += 1
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
                 a_spec = a
                 b_spec = b
                 mixed_qkv_non_spec = None
+            elif spec_prefix >= 0:
+                # Row slices: the conv update writes the verify part in place
+                # as in a verify-only batch, and causal_conv1d_fn reads the
+                # chunk part through its token stride into a fresh output.
+                mixed_qkv_spec = mixed_qkv[:spec_prefix]
+                a_spec = a[:spec_prefix]
+                b_spec = b[:spec_prefix]
+                mixed_qkv_non_spec = mixed_qkv[spec_prefix:non_spec_end]
             else:
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 a_spec = a.index_select(0, spec_token_indx)
@@ -1356,7 +1632,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                # RecoverSSM keeps one state slot a request, so the slot count
+                # no longer gives the window length.
+                max_query_len=(
+                    self.spec_query_len
+                    if self.use_recoverssm
+                    else spec_state_indices_tensor.size(-1)
+                ),
                 validate_data=False,
             )
 
@@ -1393,7 +1675,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        if XKB_GDN_NOCOPY and self.use_recoverssm and mixed_qkv_spec is not None:
+            query_spec, key_spec, value_spec = self.mixed_qkv_views(mixed_qkv_spec)
+        else:
+            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
         # Split mixed non-spec-decode+prefill to process independently
         split_non_spec = (
@@ -1407,7 +1692,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert mixed_qkv_non_spec is not None, (
                 "mixed_qkv_non_spec must be provided for prefill path"
             )
-            if spec_sequence_masks is not None:
+            if spec_prefix >= 0:
+                a_non_spec = a[spec_prefix:non_spec_end]
+                b_non_spec = b[spec_prefix:non_spec_end]
+            elif spec_sequence_masks is not None:
                 a_non_spec = a.index_select(0, non_spec_token_indx)
                 b_non_spec = b.index_select(0, non_spec_token_indx)
             else:
@@ -1456,7 +1744,48 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if spec_sequence_masks is not None and self.use_recoverssm:
+            from vllm.model_executor.layers.mamba.ops.gdn_recoverssm import (
+                gdn_recoverssm_verify,
+            )
+
+            assert spec_query_start_loc is not None
+            _, _, correction_cache, key_cache, gate_cache = self_kv_cache
+            core_attn_out_spec = gdn_recoverssm_verify(
+                q=query_spec,
+                k=key_spec,
+                v=value_spec,
+                a=a_spec,
+                b=b_spec,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                checkpoint_state=ssm_state,
+                correction_cache=correction_cache,
+                key_cache=key_cache,
+                gate_cache=gate_cache,
+                query_start_loc=spec_query_start_loc[
+                    : attn_metadata.num_spec_decodes + 1
+                ],
+                state_indices=spec_state_indices_tensor[  # type: ignore[index]
+                    : attn_metadata.num_spec_decodes, 0
+                ],
+                spec_query_len=self.spec_query_len,
+                scale=self.head_k_dim**-0.5,
+                # A verify-only batch writes its output in place, and so does
+                # the leading verify part of a sliced mixed batch.
+                out=(
+                    core_attn_out[:num_actual_tokens].unsqueeze(0)
+                    if attn_metadata.num_prefills == 0
+                    and attn_metadata.num_decodes == 0
+                    else core_attn_out[:spec_prefix].unsqueeze(0)
+                    if spec_prefix >= 0
+                    else None
+                ),
+                # GDN_FUSED_COMMIT: the group's deferred state commits.
+                fused=getattr(attn_metadata, "recoverssm_fused", None),
+            )
+            last_recurrent_state = None
+        elif spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -1514,26 +1843,77 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            initial_state = ssm_state[prefill_state_indices]
+            if is_fp8_state(ssm_state):
+                initial_state = gather_fp8_states(ssm_state, prefill_state_indices)
+            else:
+                initial_state = ssm_state[prefill_state_indices]
             initial_state[~prefill_has_initial_state, ...] = 0
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=attn_metadata.prefill_query_start_loc,
-                chunk_indices=attn_metadata.chunk_indices,
-                chunk_offsets=attn_metadata.chunk_offsets,
-                use_qk_l2norm_in_kernel=False,
+            # A sliced mixed batch: the chunk kernels write o into
+            # core_attn_out's chunk rows.
+            chunk_out = (
+                core_attn_out[spec_prefix:non_spec_end] if spec_prefix >= 0 else None
             )
+            if (
+                spec_prefix >= 0
+                and XKB_GDN_MIX >= 2
+                and self.chunk_gated_delta_rule.gdn_prefill_backend == "triton"
+                and _xkb_all_contiguous(
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                    initial_state,
+                    attn_metadata.chunk_indices,
+                    attn_metadata.chunk_offsets,
+                )
+            ):
+                assert g_non_spec is not None
+                assert beta_non_spec is not None
+                assert attn_metadata.prefill_query_start_loc is not None
+                assert attn_metadata.chunk_indices is not None
+                assert attn_metadata.chunk_offsets is not None
+                assert chunk_out is not None
+                XKB_GDN_MIX_COUNTS["lean_chunk"] += 1
+                core_attn_out_non_spec, last_recurrent_state = _xkb_lean_chunk(
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                    initial_state,
+                    attn_metadata.prefill_query_start_loc,
+                    attn_metadata.chunk_indices,
+                    attn_metadata.chunk_offsets,
+                    chunk_out,
+                )
+            else:
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = self.chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=attn_metadata.prefill_query_start_loc,
+                    chunk_indices=attn_metadata.chunk_indices,
+                    chunk_offsets=attn_metadata.chunk_offsets,
+                    use_qk_l2norm_in_kernel=False,
+                    core_attn_out=chunk_out,
+                )
             # Init cache
-            ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            if is_fp8_state(ssm_state):
+                scatter_fp8_states_(
+                    ssm_state, prefill_state_indices, last_recurrent_state
+                )
+            else:
+                ssm_state[prefill_state_indices] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
@@ -1565,7 +1945,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_non_spec, last_recurrent_state = None, None
 
         # 3. Merge core attention output
-        if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
+        if spec_prefix >= 0:
+            assert core_attn_out_spec is not None
+            assert core_attn_out_non_spec is not None
+            assert chunk_out is not None
+            # Both parts were written into core_attn_out in place; a kernel
+            # path that returned its own buffer instead is copied over.
+            if core_attn_out_spec.data_ptr() != core_attn_out.data_ptr():
+                core_attn_out[:spec_prefix] = core_attn_out_spec.squeeze(0)
+            if core_attn_out_non_spec.data_ptr() != chunk_out.data_ptr():
+                core_attn_out[spec_prefix:non_spec_end] = (
+                    core_attn_out_non_spec.squeeze(0)
+                )
+        elif spec_sequence_masks is not None and core_attn_out_non_spec is not None:
+            assert core_attn_out_spec is not None
+            assert spec_token_indx is not None
+            assert non_spec_token_indx is not None
             merged_out = torch.empty(
                 (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
                 dtype=core_attn_out_non_spec.dtype,
@@ -1575,8 +1970,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
-            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+            assert core_attn_out_spec is not None
+            if core_attn_out_spec.data_ptr() != core_attn_out.data_ptr():
+                core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
+            assert core_attn_out_non_spec is not None
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
     def _forward_core_decode_aiter(
@@ -1818,7 +2216,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> bool:
         state_indices = attn_metadata.spec_state_indices_tensor
         return (
-            attn_metadata.spec_sequence_masks is not None
+            # The fused kernel writes a state per draft token; RecoverSSM
+            # verifies through _forward_core instead.
+            not self.use_recoverssm
+            and attn_metadata.spec_sequence_masks is not None
             and attn_metadata.num_decodes == 0
             and attn_metadata.num_spec_decodes > 0
             and self.kv_cache[1].dtype in FUSED_GDN_STATE_DTYPES
@@ -1840,6 +2241,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             layer_norm_fwd,
         )
 
+        if (
+            XKB_GDN_NOCOPY
+            and _norm_gated_heads(self.norm, x, output_gate, out=out) is not None
+        ):
+            return
         x_shape = x.shape
         assert output_gate.shape == x_shape
         assert out.shape == x_shape
@@ -1895,10 +2301,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 attn_metadata=attn_metadata,
             )
             return
+        # A batch of RecoverSSM verifies alone reads b and a through their row
+        # stride; the other paths want them contiguous.
+        # A sliced mixed batch (XKB_GDN_MIX) reads them through their row
+        # stride too: the verify and fused_post_conv_prep take it.
+        verify_only = (
+            self.use_recoverssm
+            and attn_metadata.spec_sequence_masks is not None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes == 0
+        ) or getattr(attn_metadata, "xkb_spec_prefix", -1) >= 0
         self._forward_core(
             mixed_qkv=mixed_qkv,
-            b=b.contiguous(),
-            a=a.contiguous(),
+            b=b if verify_only else b.contiguous(),
+            a=a if verify_only else a.contiguous(),
             core_attn_out=core_attn_out,
         )
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -1909,6 +2325,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
 
+@eager_break_during_capture
 def qwen_gdn_attention_core(
     qkv_or_qkvz: torch.Tensor,
     b_or_ba: torch.Tensor,
@@ -1969,6 +2386,7 @@ direct_register_custom_op(
 )
 
 
+@eager_break_during_capture
 def qwen_gdn_attention_core_fused_norm_packed(
     mixed_qkvz: torch.Tensor,
     ba: torch.Tensor,

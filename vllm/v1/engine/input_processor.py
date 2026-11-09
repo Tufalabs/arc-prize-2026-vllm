@@ -101,6 +101,50 @@ class InputProcessor:
                 self.tokenizer,
             )
 
+            if (
+                params.logit_bias
+                and self.speculative_config is not None
+                and not self.vllm_config.use_v2_model_runner
+            ):
+                # The V2 model runner applies the bias to the target's logits
+                # at every verified position, so a biased-away draft is
+                # rejected and never resampled; the V1 runner does not.
+                raise VLLMValidationError(
+                    "logit_bias with speculative decoding requires the V2 model "
+                    "runner, which verifies every draft against the biased "
+                    "logits. Set VLLM_USE_V2_MODEL_RUNNER=1."
+                )
+
+            if getattr(params, "zero_recurrent_state", False):
+                # Rejected HERE rather than in the worker: the blank is
+                # implemented only by the V2 model runner, and a hybrid model
+                # is not in the default-V2 set, so on V1 the scheduler would
+                # still cut the prefill chunk at the position while nothing
+                # ever blanked -- a request that looks served and is not.
+                if not self.vllm_config.use_v2_model_runner:
+                    raise VLLMValidationError(
+                        "zero_recurrent_state requires the V2 model runner, which "
+                        "is what implements the blank; on V1 the request would run "
+                        "and never blank. Set VLLM_USE_V2_MODEL_RUNNER=1."
+                    )
+                if not self.model_config.is_hybrid:
+                    # A model with no recurrent state has nothing to blank.
+                    # Checked here so every model that cannot implement the
+                    # parameter fails before enqueueing: the model state's own
+                    # refusal comes from the worker, after the request has
+                    # been added.
+                    raise VLLMValidationError(
+                        "zero_recurrent_state requires a hybrid (recurrent) model; "
+                        f"{self.model_config.model!r} has no recurrent state to blank."
+                    )
+                mamba_cache_mode = self.vllm_config.cache_config.mamba_cache_mode
+                if mamba_cache_mode != "align":
+                    raise VLLMValidationError(
+                        "zero_recurrent_state requires mamba_cache_mode='align' "
+                        "(the blank is applied to the aligned running block); this "
+                        f"engine is running {mamba_cache_mode!r}."
+                    )
+
             if self.model_config.return_sampling_mask:
                 if params.temperature <= 0:
                     raise ValueError(
@@ -360,6 +404,33 @@ class InputProcessor:
                     prompt_token_ids, prompt_embeds
                 )
                 sampling_params.max_tokens = self.model_config.max_model_len - seq_len
+
+            if getattr(sampling_params, "zero_recurrent_state", False):
+                # Checked here because this is the first point that knows the
+                # tokenized prompt. A position the prompt does not reach can
+                # only be honoured during decode -- num_computed keeps
+                # climbing as tokens are generated, so the worker would stand
+                # at the target a few steps in and blank the state the model
+                # built while writing its answer. That is a perturbation of
+                # the generation rather than of the prompt, so the request is
+                # refused rather than served as something else.
+                prompt_len = length_from_prompt_token_ids_or_embeds(
+                    prompt_token_ids, prompt_embeds
+                )
+                # Bound before comparing: the flag does not narrow the
+                # Optional for the type checker, and SamplingParams already
+                # refuses the flag without a position, so None here is a
+                # broken invariant rather than a case to handle.
+                target = sampling_params.zero_recurrent_at
+                assert target is not None, "zero_recurrent_state without a position"
+                if target >= prompt_len:
+                    raise VLLMValidationError(
+                        "zero_recurrent_at="
+                        f"{target} is not inside this "
+                        f"request's prompt of {prompt_len} tokens, so no prefill "
+                        "step can stand at it. Give a position below the prompt "
+                        "length, or drop zero_recurrent_state for this request."
+                    )
 
             sampling_params.update_from_generation_config(
                 self.generation_config_fields,

@@ -377,6 +377,67 @@ class SamplingParams(
     """If provided, forces the engine to emit this predetermined sequence of
     token IDs during decoding instead of sampling randomly. Real logprobs are
     still computed. Conflict checking is performed at the engine level."""
+    zero_recurrent_state: bool = False
+    """Hybrid (Mamba / linear-attention) models only: zero this request's
+    recurrent state at a chosen prompt position, while the attention KV
+    cache still covers the whole prompt. The prompt
+    tokens after the position are then integrated into the zeroed state as
+    usual, so the model decodes with verbatim (attention) recall of the
+    entire prompt but a running (recurrent) summary of only the tokens after
+    the position. False disables the feature entirely; an unblanked request
+    takes the stock code path. Requires `mamba_cache_mode="align"`; rejected
+    for other configurations rather than silently ignored.
+
+    Origin, briefly: this attention-warm / state-blank combination is what
+    vLLM 0.25.1 served on warm prefix-cache hits when a CPU KV-offload
+    connector was configured on a hybrid model, and it measurably changed
+    agent behaviour. This parameter produces the same state on purpose, on
+    an engine that no longer has the bug.
+
+    WHY THIS IS A SAMPLING PARAMETER, AND WHAT THAT COSTS. Prefix caching
+    hashes token ids, never sampling parameters, so a blanked request writes
+    perturbed recurrent state -- and, past the next block boundary, perturbed
+    downstream attention KV -- under the hash of the unmodified tokens. Two
+    requests sharing a prefix but asking for different positions (or one
+    asking and one not) can therefore silently serve each other's state; a
+    position INSIDE a shared prefix is the worst case, poisoning a page every
+    later request resumes from. An engine-level position was implemented to
+    close this by construction (one engine, one world, nothing to mix) and
+    rejected: agents with different system prompts -- a main agent and its
+    subagents, say -- need different positions on the same engine, which an
+    engine-wide setting cannot express. So the position stays per-request,
+    and consistency is the CALLER's responsibility: every request sharing a
+    prefix must ask for the same position, and the position should sit at or
+    beyond the end of any prefix shared with requests that ask differently.
+    Same-prefix-same-position reuse is not a hazard but intended behaviour:
+    a later request on the same prefix inherits the blank's downstream state
+    from the cache instead of being blanked again (see the scheduler)."""
+    zero_recurrent_at: int | None = None
+    """Where the blank is placed, as an ABSOLUTE prompt position (ignored
+    when `zero_recurrent_state` is False).
+
+    An absolute position names the same physical boundary however long the
+    prompt is -- the natural spelling for blanking at a fixed structural
+    point, such as a recurrent block boundary inside a shared system prompt
+    -- and it does not require the caller to know the prompt's exact token
+    count, and required when `zero_recurrent_state` is set.
+
+    Must land INSIDE the prompt: a request whose prompt does not reach the
+    position is rejected. Such a position could only be honoured during
+    decode, where it would blank the state the model built while writing its
+    answer rather than a prompt position, and serving a different
+    perturbation under the same request is worse than refusing it. Callers
+    sizing the position against their own tokenization should expect this to
+    bite when the two disagree.
+
+    An absolute position is the ONLY spelling. A lag counted back from the
+    end of the prompt reads naturally but cannot be made cache-safe: it
+    resolves to a different absolute position on every call as the prompt
+    grows, while the recurrent state written under a shared prefix records
+    where the blank actually landed. A warm hit past the new position is
+    then treated as already blanked, though the state it inherits was
+    blanked somewhere else, and the call silently stops matching its own
+    cold result."""
 
     @staticmethod
     def from_optional(
@@ -414,6 +475,11 @@ class SamplingParams(
         routed_experts_prompt_start: int = 0,
         # Debugging / RL-specific parameters.
         trace_decode_token_ids: list[int] | None = None,
+        # LAST, after every pre-existing parameter: this signature is
+        # positional, so anything inserted earlier silently renumbers the
+        # arguments a caller already passes.
+        zero_recurrent_state: bool = False,
+        zero_recurrent_at: int | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Fast path uses a dict comprehension; on failure we iterate once
@@ -474,6 +540,8 @@ class SamplingParams(
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
             extra_args=extra_args,
+            zero_recurrent_state=zero_recurrent_state,
+            zero_recurrent_at=zero_recurrent_at,
             skip_clone=skip_clone,
             repetition_detection=repetition_detection,
             routed_experts_prompt_start=routed_experts_prompt_start,
@@ -544,6 +612,29 @@ class SamplingParams(
 
     def _verify_args(self) -> None:
         _verify_num_sequences(self.n, "n")
+        if self.zero_recurrent_at is not None:
+            if not isinstance(self.zero_recurrent_at, int):
+                raise ValueError(
+                    "zero_recurrent_at must be an int, but is of type "
+                    f"{type(self.zero_recurrent_at)}"
+                )
+            if self.zero_recurrent_at < 0:
+                raise ValueError(
+                    "zero_recurrent_at must be non-negative, got "
+                    f"{self.zero_recurrent_at}."
+                )
+        if self.zero_recurrent_at is not None and not self.zero_recurrent_state:
+            raise ValueError(
+                "zero_recurrent_at is set but zero_recurrent_state is False, so "
+                "nothing would be blanked. Set zero_recurrent_state=True, or drop "
+                "the position."
+            )
+        if self.zero_recurrent_state and self.zero_recurrent_at is None:
+            raise ValueError(
+                "zero_recurrent_state is set without zero_recurrent_at. The blank "
+                "position has no default: it decides which state the model keeps, "
+                "and a wrong one is a different perturbation."
+            )
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise VLLMValidationError(
                 f"presence_penalty must be in [-2, 2], got {self.presence_penalty}."
@@ -1017,10 +1108,13 @@ class SamplingParams(
             return
 
         # Some sampling parameters are not yet compatible with spec decoding.
-        if self.min_p > _SAMPLING_EPS or self.logit_bias:
+        # logit_bias is allowed: the V2 model runner biases the target's
+        # logits at every verified position before rejection sampling, and
+        # the input processor refuses it under V1, which does not.
+        if self.min_p > _SAMPLING_EPS:
             raise VLLMValidationError(
-                "The min_p and logit_bias sampling parameters "
-                "are not yet supported with speculative decoding."
+                "The min_p sampling parameter is not yet supported with "
+                "speculative decoding."
             )
 
     def _validate_diffusion(self, model_config: ModelConfig) -> None:

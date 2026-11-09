@@ -237,6 +237,34 @@ def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders():
     assert req.request_id in output.num_scheduled_tokens
 
 
+@pytest.mark.parametrize("balanced", [True, False])
+def test_pp_decodes_are_split_evenly_between_micro_batches(monkeypatch, balanced):
+    """V2 model runner + PP + async: a request decodes in the micro-batch of
+    the step its prefill ended. With VLLM_PP_BALANCED_MICRO_BATCHES a step
+    decodes at most an even share of its eligible decodes and those in
+    flight, the rest a step later, so six requests prefilled in one step
+    decode three and three; without it, six and none."""
+    monkeypatch.setenv("VLLM_PP_BALANCED_MICRO_BATCHES", "1" if balanced else "0")
+    scheduler = create_scheduler(
+        async_scheduling=True, pipeline_parallel_size=2, use_v2_model_runner=True
+    )
+    # Without Triton (the CPU runner) the config falls back to the V1 model
+    # runner; the scheduler's V2 cadence and balance are set as on a GPU.
+    scheduler.use_v2_model_runner = True
+    scheduler.pp_balanced_micro_batches = (
+        scheduler.use_pp and envs.VLLM_PP_BALANCED_MICRO_BATCHES
+    )
+    assert scheduler.pp_balanced_micro_batches == balanced
+    for req in create_requests(num_requests=6, num_tokens=8):
+        scheduler.add_request(req)
+    sizes = [len(scheduler.schedule().num_scheduled_tokens) for _ in range(5)]
+    # Step 1 prefills all six; their decodes start at step 3.
+    if balanced:
+        assert sizes == [6, 0, 3, 3, 3]
+    else:
+        assert sizes == [6, 0, 6, 0, 6]
+
+
 def test_cached_request_data_resumed_all_token_ids_mrv1_only():
     """all_token_ids carries a resumed request's token ids to the connector
     for the V1 model runner, but is skipped entirely for the V2 model runner.
@@ -5941,8 +5969,14 @@ def _create_hybrid_mamba_connector_scheduler(
     block_size: int = 16,
     num_blocks: int = 100,
     supports_divergent_hits: bool = True,
+    fill: bool = False,
+    max_num_batched_tokens: int = 8192,
+    mamba_cache_mode: str = "all",
+    is_async: bool = False,
+    match_req_prefix: str | None = None,
 ) -> Scheduler:
-    """FA + Mamba ("all" cache mode) scheduler with a MockKVConnector."""
+    """FA + Mamba scheduler with a MockKVConnector ("all" cache mode unless told
+    otherwise)."""
     model_config = ModelConfig(
         model="facebook/opt-125m",
         trust_remote_code=True,
@@ -5953,7 +5987,7 @@ def _create_hybrid_mamba_connector_scheduler(
     vllm_config = VllmConfig(
         scheduler_config=SchedulerConfig(
             max_num_seqs=4,
-            max_num_batched_tokens=8192,
+            max_num_batched_tokens=max_num_batched_tokens,
             max_model_len=8192,
             enable_chunked_prefill=True,
             is_encoder_decoder=False,
@@ -5963,15 +5997,17 @@ def _create_hybrid_mamba_connector_scheduler(
         cache_config=CacheConfig(
             block_size=block_size,
             enable_prefix_caching=True,
-            mamba_cache_mode="all",
+            mamba_cache_mode=mamba_cache_mode,
         ),
         kv_transfer_config=KVTransferConfig(
             kv_connector="MockKVConnector",
             kv_role="kv_both",
             kv_connector_extra_config={
                 "matched_tokens": matched_tokens,
-                "is_async": False,
+                "is_async": is_async,
                 "supports_divergent_local_hybrid_hits": supports_divergent_hits,
+                "fill": fill,
+                "match_req_prefix": match_req_prefix,
             },
         ),
     )
@@ -5995,7 +6031,7 @@ def _create_hybrid_mamba_connector_scheduler(
                     block_size=block_size,
                     shapes=((1, 1),),
                     dtypes=(torch.float32,),
-                    mamba_cache_mode="all",
+                    mamba_cache_mode=mamba_cache_mode,
                 ),
             ),
         ],
@@ -6148,6 +6184,162 @@ def test_hybrid_fa_deeper_hit_respects_connector_lookup_policy(
     output = scheduler.schedule()
     num_scheduled = output.num_scheduled_tokens[replay.request_id]
     assert replay.num_tokens - num_scheduled == expected_num_computed
+
+
+def test_hybrid_per_group_hit_divergence_fa_deeper_filled_by_connector():
+    """Same divergence as above, with a connector that holds the Mamba state
+    at the boundary of the deep FA hit. The scheduler keeps the deep hit,
+    allocates one block for the lagging group at that boundary, holds the
+    request for the load, and resumes at the FA hit once the load lands —
+    instead of recomputing from the convergent boundary.
+    """
+    from tests.v1.kv_connector.unit.utils import create_model_runner_output
+
+    block_size = 16
+    scheduler = _create_hybrid_mamba_connector_scheduler(matched_tokens=0, fill=True)
+    manager = scheduler.kv_cache_manager
+    assert isinstance(manager.coordinator, HybridKVCacheCoordinator)
+
+    [fill] = create_requests(
+        num_requests=1,
+        num_tokens=4 * block_size,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=block_size,
+        req_ids=["fill"],
+    )
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(fill)
+    blocks = manager.allocate_slots(
+        fill, fill.num_tokens, num_computed, computed_blocks
+    )
+    mamba_ids = [b.block_id for b in blocks.blocks[1]]
+    manager.free(fill)
+    manager.block_pool.evict_blocks({mamba_ids[1], mamba_ids[2], mamba_ids[3]})
+
+    [replay] = create_requests(
+        num_requests=1,
+        num_tokens=5 * block_size,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=block_size,
+        req_ids=["replay"],
+    )
+    _, per_group_hits = manager.coordinator.find_longest_cache_hit_per_group(
+        replay.block_hashes, replay.num_tokens - 1
+    )
+    assert per_group_hits == (4 * block_size, 1 * block_size)  # FA deeper
+
+    scheduler.add_request(replay)
+    output = scheduler.schedule()
+
+    # Asked to fill the mamba group at the FA boundary, and accepted: the
+    # request waits for the load with the deep hit recorded.
+    connector = scheduler.connector
+    assert connector.fills == [(replay.request_id, 4 * block_size, (1,))]
+    assert replay.request_id not in output.num_scheduled_tokens
+    assert replay.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert replay.num_computed_tokens == 4 * block_size
+    fa_blocks, mamba_blocks = manager.get_blocks(replay.request_id).blocks
+    assert len(fa_blocks) == 4 and all(b.block_hash is not None for b in fa_blocks)
+    # The lagging group: nulls for the skipped chunks, one fresh block at the
+    # boundary for the connector to fill, none of its shallower hit adopted.
+    assert [b.is_null for b in mamba_blocks] == [True, True, True, False]
+    assert mamba_blocks[-1].block_hash is None
+    assert mamba_blocks[-1].block_id not in mamba_ids
+
+    # The load lands: the filled block is cached as the state at the
+    # boundary, and the request resumes at the FA hit.
+    scheduler.update_from_output(
+        output, create_model_runner_output([], finished_recving={replay.request_id})
+    )
+    output = scheduler.schedule()
+    num_scheduled = output.num_scheduled_tokens[replay.request_id]
+    assert replay.num_tokens - num_scheduled == 4 * block_size
+    _, mamba_blocks = manager.get_blocks(replay.request_id).blocks
+    assert mamba_blocks[3].block_hash is not None
+
+
+def test_hybrid_align_budget_blocked_head_does_not_block_budget_free_admissions():
+    """Align mode with a step budget of one block and a little: a prefilling
+    request takes one aligned chunk a step and leaves less than a block, so
+    the next cold request's chunk comes out at zero. That request is set
+    aside for the step rather than stopping admission, so a request behind
+    it whose hit loads asynchronously — which needs no budget — is admitted,
+    and the cold one stays first in line.
+    """
+    block_size = 16
+    scheduler = _create_hybrid_mamba_connector_scheduler(
+        matched_tokens=2 * block_size,
+        max_num_batched_tokens=block_size + 8,
+        mamba_cache_mode="align",
+        is_async=True,
+        match_req_prefix="ext",
+    )
+    # Distinct prompts: a shared prefix with the running prefill would make
+    # the served request's Mamba hit land on a block cached this very step,
+    # which defers it for a different reason.
+    cold_a, cold_b, served = create_requests(
+        num_requests=3,
+        num_tokens=10 * block_size,
+        max_tokens=2,
+        same_prompt=False,
+        block_size=block_size,
+        req_ids=["cold_a", "cold_b", "ext_served"],
+    )
+    scheduler.add_request(cold_a)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {cold_a.request_id: block_size}
+
+    scheduler.add_request(cold_b)
+    scheduler.add_request(served)
+    output = scheduler.schedule()
+    # The running prefill takes its block; the cold head cannot start one on
+    # the 8 tokens left, but the served request behind it is admitted anyway.
+    assert output.num_scheduled_tokens == {cold_a.request_id: block_size}
+    assert served.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert served.num_computed_tokens == 2 * block_size
+    assert cold_b.status == RequestStatus.WAITING
+    assert scheduler.skipped_waiting.peek_request() is cold_b
+
+
+def test_hybrid_align_spent_budget_still_admits_budget_free_loads():
+    """Align mode with a step budget of exactly one block: the running
+    prefill's aligned chunk spends the whole budget every step. A request
+    whose hit loads asynchronously needs no budget and is admitted all the
+    same, and a cold request with nothing to load stays first in line.
+    Stopping admission at a spent budget left every such request waiting
+    while the prefill ran, its host copy aging out of the tier (the four-L4
+    cell at 512 tokens a step)."""
+    block_size = 16
+    scheduler = _create_hybrid_mamba_connector_scheduler(
+        matched_tokens=2 * block_size,
+        max_num_batched_tokens=block_size,
+        mamba_cache_mode="align",
+        is_async=True,
+        match_req_prefix="ext",
+    )
+    cold_a, cold_b, served = create_requests(
+        num_requests=3,
+        num_tokens=10 * block_size,
+        max_tokens=2,
+        same_prompt=False,
+        block_size=block_size,
+        req_ids=["cold_a", "cold_b", "ext_served"],
+    )
+    scheduler.add_request(cold_a)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {cold_a.request_id: block_size}
+
+    scheduler.add_request(cold_b)
+    scheduler.add_request(served)
+    output = scheduler.schedule()
+    # The running prefill takes the whole budget; the served request is
+    # admitted to load all the same, and the cold one waits first in line.
+    assert output.num_scheduled_tokens == {cold_a.request_id: block_size}
+    assert served.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert served.num_computed_tokens == 2 * block_size
+    assert cold_b.status == RequestStatus.WAITING
+    assert scheduler.skipped_waiting.peek_request() is cold_b
 
 
 def _make_encoder_instance_request(scheduler, text_prefix=8, image_tokens=16):

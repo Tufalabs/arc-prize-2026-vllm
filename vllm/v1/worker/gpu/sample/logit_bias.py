@@ -51,6 +51,9 @@ class LogitBiasState:
 
         # Using any of the above.
         self.use_logit_bias = np.zeros(max_num_reqs, dtype=bool)
+        # Whether a request's logit bias raises any token (the model runner's
+        # local top-k logits stay exact under bias that only lowers).
+        self.raises_logits = np.zeros(max_num_reqs, dtype=bool)
 
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
@@ -86,8 +89,10 @@ class LogitBiasState:
             self.logit_bias_token_ids.stage_write(req_idx, 0, logit_bias.keys())
             self.logit_bias.stage_write(req_idx, 0, logit_bias.values())
             use_logit_bias = True
+            self.raises_logits[req_idx] = any(b > 0 for b in logit_bias.values())
         else:
             self.num_logit_bias.np[req_idx] = 0
+            self.raises_logits[req_idx] = False
 
         # Min tokens.
         min_tokens = sampling_params.min_tokens

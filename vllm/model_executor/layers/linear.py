@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import fnmatch  # XKB: XKB_DENSE_KN
+import os  # XKB: XKB_DENSE_KN
 from abc import abstractmethod
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -44,6 +46,62 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+# XKB_DENSE_KN=PATTERNS (run/k16/kn): comma-separated fnmatch patterns over an
+# unquantized linear layer's prefix, for example
+# "*.in_proj_qkvz,*.self_attn.qkv_proj"; "1" means "*.in_proj_qkvz".
+# A matching CUDA bf16/fp16 weight [N, K] is rewritten in place into the
+# [K, N] layout and kept as an [N, K] view with strides (1, N).
+# F.linear then passes cuBLAS a non-transposed B, and cuBLAS picks its nn
+# kernels instead of tn.
+# The weight keeps its storage and values; the transpose goes through host
+# memory, so GPU memory does not change.
+# Outputs can differ in the last bit where the nn kernel sums in another order.
+# Unset, empty or 0: no layer changes.
+_XKB_DENSE_KN = os.environ.get("XKB_DENSE_KN", "").strip()
+_XKB_DENSE_KN_PATTERNS = (
+    []
+    if _XKB_DENSE_KN in ("", "0")
+    else ["*.in_proj_qkvz"]
+    if _XKB_DENSE_KN == "1"
+    else [p.strip() for p in _XKB_DENSE_KN.split(",") if p.strip()]
+)
+# (prefix, N, K) of every restrided weight
+XKB_DENSE_KN_LAYERS: list[tuple[str, int, int]] = []
+
+
+def _xkb_dense_kn(layer: torch.nn.Module) -> None:
+    prefix = getattr(layer, "prefix", "") or ""
+    if not any(fnmatch.fnmatchcase(prefix, p) for p in _XKB_DENSE_KN_PATTERNS):
+        return
+    w = getattr(layer, "weight", None)
+    w = None if w is None else w.data
+    if (
+        w is None
+        or w.dim() != 2
+        or not w.is_cuda
+        or w.dtype not in (torch.bfloat16, torch.float16)
+        or not w.is_contiguous()
+        or min(w.shape) < 2
+    ):
+        logger.warning(
+            "XKB_DENSE_KN: %s keeps its layout (%s)",
+            prefix,
+            "no weight"
+            if w is None
+            else f"{tuple(w.shape)} {w.dtype} strides {w.stride()} {w.device}",
+        )
+        return
+    n, k = w.shape
+    transposed = w.cpu().t().contiguous()  # [K, N] on the host
+    torch.as_strided(w, (k, n), (n, 1)).copy_(transposed)
+    layer.weight.data = torch.as_strided(w, (n, k), (1, n))
+    if not any(s[1:] == (n, k) for s in XKB_DENSE_KN_LAYERS):
+        logger.info(
+            "XKB_DENSE_KN: weights [%d, %d] stored as [K, N] (first: %s)", n, k, prefix
+        )
+    XKB_DENSE_KN_LAYERS.append((prefix, n, k))
+
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "UnquantizedLinearMethod",
@@ -224,6 +282,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 and weight.stride(0) != 1
             ):
                 layer.weight.data = weight.t().contiguous().t()
+        elif _XKB_DENSE_KN_PATTERNS and current_platform.is_cuda():
+            _xkb_dense_kn(layer)
 
     def apply(
         self,

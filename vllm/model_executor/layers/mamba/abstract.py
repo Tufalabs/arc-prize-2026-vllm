@@ -77,10 +77,13 @@ class MambaBase(AttentionLayerBase):
             tp_replicated=self.is_kv_cache_tp_replicated,
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
             # RecoverSSM verifies the whole window off one checkpoint, so it
-            # never writes the baseline's per-draft-token state slots.
+            # never writes the baseline's per-draft-token state slots. Under
+            # GDN RecoverSSM that holds for every Mamba group, the conv-only
+            # PLE group included, since all groups share this count.
             num_speculative_blocks=(
                 0
                 if vllm_config.cache_config.use_kda_recoverssm
+                or vllm_config.cache_config.use_gdn_recoverssm
                 else vllm_config.num_speculative_tokens
             ),
         )

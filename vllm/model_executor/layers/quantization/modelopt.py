@@ -124,6 +124,19 @@ class ModelOptKVCacheMethod(BaseKVCacheMethod):
         super().__init__(quant_config)
 
 
+def _is_online_fp8_linear(prefix: str) -> bool:
+    """Whether a linear layer the checkpoint leaves unquantized is quantized to
+    FP8 at load instead: its prefix matches a wildcard in
+    ``additional_config["online_fp8_linear"]``. Per output channel weights and
+    per token activations (FP8_DYNAMIC's layout), as
+    ``Fp8PtpcOnlineLinearMethod`` quantizes them from the checkpoint's bf16."""
+    additional_config = get_current_vllm_config().additional_config
+    if not isinstance(additional_config, dict):
+        return False
+    patterns = additional_config.get("online_fp8_linear") or ()
+    return any(fnmatch(prefix, pattern) for pattern in patterns)
+
+
 class ModelOptQuantConfigBase(QuantizationConfig):
     LinearMethodCls: type = LinearMethodBase
     FusedMoEMethodCls: type = FusedMoEMethodBase
@@ -183,6 +196,12 @@ class ModelOptQuantConfigBase(QuantizationConfig):
 
         # handle exclusion
         if self.is_layer_excluded(prefix):
+            if isinstance(layer, LinearBase) and _is_online_fp8_linear(prefix):
+                from vllm.model_executor.layers.quantization.online.fp8 import (
+                    Fp8PtpcOnlineLinearMethod,
+                )
+
+                return Fp8PtpcOnlineLinearMethod()
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 return UnquantizedLinearMethod()
             return None
@@ -1795,8 +1814,6 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
                 "Dynamic quantization is not supported."
             )
 
-        self.kernel = init_mxfp8_linear_kernel()
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -1826,6 +1843,12 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
                 f"MXFP8 requires input dimension to be divisible by "
                 f"{MXFP8_BLOCK_SIZE}, got {input_size_per_partition}"
             )
+
+        # The kernel per layer, by its (N, K): mm_mxfp8 cannot serve a layer
+        # below its shape limits.
+        self.kernel = init_mxfp8_linear_kernel(
+            weight_shape=(output_size_per_partition, input_size_per_partition)
+        )
 
         # Weight tensor: FP8 E4M3 format
         weight = ModelWeightParameter(

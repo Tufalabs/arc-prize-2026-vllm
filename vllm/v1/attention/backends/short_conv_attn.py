@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass, replace
-from typing import Any
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -12,16 +12,29 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.gdn_attn import get_recoverssm_commit_context
 from vllm.v1.attention.backends.mamba_attn import (
     BaseMambaAttentionMetadata,
     BaseMambaAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.recoverssm_metadata import (
+    RecoverSSMAlignMetadata,
+    RecoverSSMCommitMetadata,
+    RecoverSSMMetadata,
+    RecoverSSMPostprocessMetadata,
+    commit_recoverssm_step,
+    defer_recoverssm_commit,
+)
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
-    compute_causal_conv1d_metadata,
     mamba_get_block_table_tensor,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.mamba.ops.gdn_recoverssm import (
+        GDNRecoverSSMCommitContext,
+    )
 
 
 class ShortConvAttentionBackend(AttentionBackend):
@@ -91,6 +104,36 @@ class PleShortConvAttentionMetadata(ShortConvAttentionMetadata):
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
 
 
+@dataclass
+class PleShortConvRecoverSSMAttentionMetadata(
+    PleShortConvAttentionMetadata, RecoverSSMMetadata
+):
+    """PLE metadata under GDN RecoverSSM. The GDN commit resets every Mamba
+    group's accepted count to one, so this conv-only group commits too: its
+    conv window compacts to the accepted position, into the column the GDN
+    state lands in."""
+
+    recoverssm_commit: RecoverSSMCommitMetadata | None = None
+    recoverssm_context: "GDNRecoverSSMCommitContext | None" = field(
+        default=None, repr=False, compare=False
+    )
+
+    def commit_recoverssm_state(
+        self, num_accepted_tokens: torch.Tensor
+    ) -> RecoverSSMPostprocessMetadata | None:
+        return commit_recoverssm_step(
+            self.recoverssm_commit,
+            self.recoverssm_context,
+            self.num_spec_decodes,
+            num_accepted_tokens,
+        )
+
+    def deferred_commit(self) -> RecoverSSMMetadata | None:
+        return defer_recoverssm_commit(
+            self.recoverssm_commit, self.recoverssm_context, self.num_spec_decodes
+        )
+
+
 class PleShortConvAttentionBackend(ShortConvAttentionBackend):
     @staticmethod
     def get_name() -> str:
@@ -108,6 +151,11 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold: int = 1
     supports_update_block_table = False
+    # Set by the model state before each build: the batch's decode-tail
+    # targets for this group (RecoverSSMAlignMetadata), or None.
+    decode_tail_boundaries: torch.Tensor | None = None
+    decode_tail_blocks: torch.Tensor | None = None
+    needs_causal_conv1d_metadata = False
 
     def __init__(
         self,
@@ -121,6 +169,17 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         self.use_full_cuda_graph = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         )
+        # Under GDN RecoverSSM this group commits alongside the GDN groups
+        # (PleShortConvRecoverSSMAttentionMetadata).
+        self.use_recoverssm: bool = vllm_config.cache_config.use_gdn_recoverssm
+        self.recoverssm_num_accepted_tokens: torch.Tensor | None = None
+        self.recoverssm_context: GDNRecoverSSMCommitContext | None = None
+        if self.use_recoverssm:
+            self.recoverssm_num_accepted_tokens = torch.ones(
+                vllm_config.scheduler_config.max_num_seqs,
+                dtype=torch.int32,
+                device=device,
+            )
 
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         max_capture_size = self.compilation_config.max_cudagraph_capture_size
@@ -140,12 +199,6 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         )
         self.spec_sequence_masks = torch.empty(
             (self.decode_cudagraph_max_bs,), dtype=torch.bool, device=device
-        )
-        self.spec_token_indx = torch.empty(
-            (self.decode_cudagraph_max_tokens,), dtype=torch.int32, device=device
-        )
-        self.non_spec_token_indx = torch.empty(
-            (self.decode_cudagraph_max_tokens,), dtype=torch.int32, device=device
         )
         self.spec_query_start_loc = torch.empty(
             (self.decode_cudagraph_max_bs + 1,), dtype=torch.int32, device=device
@@ -257,6 +310,13 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         # spec-decode request.
         if self.use_spec_decode and num_decode_draft_tokens_cpu is not None:
             candidate_mask = num_decode_draft_tokens_cpu[: m.num_reqs] >= 0
+            if self.use_recoverssm:
+                # The GDN builder's classification: every decode commits.
+                assert m.is_prefilling is not None
+                assert m.is_prefilling.device.type == "cpu"
+                candidate_mask |= (~m.is_prefilling[: m.num_reqs]) & (
+                    torch.diff(m.query_start_loc_cpu)[: m.num_reqs] == 1
+                )
             if bool(candidate_mask.any().item()):
                 spec_sequence_masks_cpu = candidate_mask
 
@@ -287,18 +347,10 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
                 spec_sequence_masks_cpu, device=query_start_loc.device
             )
 
-        # For causal_conv1d (non-spec prefill Triton kernel metadata).
-        nums_dict = None
-        batch_ptr = None
-        token_chunk_offset_ptr = None
         has_initial_states_p = None
         has_initial_states_d = None
         num_computed_tokens_p = None
-        # Original request indices of the non-spec requests, ordered
-        # [decodes, prefills]. Used to gather per-request data consistently.
-        non_spec_req_idx_cpu: torch.Tensor | None = None
 
-        query_lens = torch.diff(query_start_loc)
         # Per-request classification by mask, NOT by position. With
         # spec-decode, the front decode group can contain both spec-decode
         # requests and plain non-spec single-token decodes. Spec requests are
@@ -323,51 +375,60 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             else 0
         )
 
-        # Original request indices grouped as
-        # [spec | non-spec decode | non-spec prefill]; each group keeps the
-        # original (already reordered) relative order via a stable nonzero.
-        spec_req_idx_cpu = spec_sequence_masks_cpu.nonzero(as_tuple=True)[0]
-        decode_req_idx_cpu = decode_mask_cpu.nonzero(as_tuple=True)[0]
-        prefill_req_idx_cpu = prefill_mask_cpu.nonzero(as_tuple=True)[0]
-        non_spec_req_idx_cpu = torch.cat((decode_req_idx_cpu, prefill_req_idx_cpu))
-        spec_req_idx = spec_req_idx_cpu.to(query_start_loc.device)
-        non_spec_req_idx = non_spec_req_idx_cpu.to(query_start_loc.device)
+        assert num_accepted_tokens is not None
+        non_spec_req_idx: torch.Tensor | None = None
 
         if num_decodes == 0 and num_prefills == 0:
-            # Pure speculative-decode batch: all real tokens are spec tokens.
-            spec_token_indx = torch.arange(
-                num_spec_decode_tokens,
-                dtype=torch.int32,
-                device=query_start_loc.device,
+            # All real requests are speculative; zero-length padding is trailing.
+            spec_token_indx = None
+            non_spec_token_indx = None
+            # RecoverSSM's commit indexes the speculative requests: here the
+            # first num_spec_decodes, built on the device without a sync.
+            spec_req_idx = torch.arange(
+                num_spec_decodes, dtype=torch.int64, device=query_start_loc.device
             )
-            non_spec_token_indx = torch.empty(
-                0, dtype=torch.int32, device=query_start_loc.device
-            )
-            spec_state_indices_tensor = block_table_tensor[spec_req_idx, 0]
+            spec_state_indices_tensor = block_table_tensor[:num_spec_decodes, 0]
+            num_accepted_tokens = num_accepted_tokens[:num_spec_decodes]
             non_spec_state_indices_tensor = None
             spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
             non_spec_query_start_loc = None
-            non_spec_query_start_loc_cpu = None
         else:
             # Mixed batch: build a per-token group key consistent with the
             # request grouping above (spec=0 | decode=1 | prefill=2) and a
             # stable sort, so tokens of each request stay contiguous and in
             # request order. This yields spec tokens first, then the non-spec
             # [decode, prefill] tokens.
+            query_lens = torch.diff(query_start_loc)
+            spec_req_idx_cpu = spec_sequence_masks_cpu.nonzero(as_tuple=True)[0]
+            decode_req_idx_cpu = decode_mask_cpu.nonzero(as_tuple=True)[0]
+            prefill_req_idx_cpu = prefill_mask_cpu.nonzero(as_tuple=True)[0]
+            non_spec_req_idx_cpu = torch.cat((decode_req_idx_cpu, prefill_req_idx_cpu))
+            spec_req_idx = async_tensor_h2d(
+                spec_req_idx_cpu, device=query_start_loc.device
+            )
+            non_spec_req_idx = async_tensor_h2d(
+                non_spec_req_idx_cpu, device=query_start_loc.device
+            )
+            decode_req_idx = async_tensor_h2d(
+                decode_req_idx_cpu, device=query_start_loc.device
+            )
             req_group = torch.full(
                 (m.num_reqs,),
                 2,
                 dtype=torch.int64,
                 device=query_start_loc.device,
             )
-            req_group[spec_req_idx] = 0
-            req_group[decode_req_idx_cpu.to(query_start_loc.device)] = 1
-            token_group = torch.repeat_interleave(req_group, query_lens)
+            req_group.index_fill_(0, spec_req_idx, 0)
+            req_group.index_fill_(0, decode_req_idx, 1)
+            token_group = torch.repeat_interleave(
+                req_group, query_lens, output_size=int(query_start_loc_cpu[-1])
+            )
             token_perm = torch.argsort(token_group, stable=True)
             spec_token_indx = token_perm[:num_spec_decode_tokens]
             non_spec_token_indx = token_perm[num_spec_decode_tokens:]
 
             spec_state_indices_tensor = block_table_tensor[spec_req_idx, 0]
+            num_accepted_tokens = num_accepted_tokens[spec_req_idx]
             non_spec_state_indices_tensor = block_table_tensor[non_spec_req_idx, 0]
             spec_query_start_loc = torch.zeros(
                 num_spec_decodes + 1,
@@ -385,24 +446,13 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
                 dim=0,
                 out=non_spec_query_start_loc[1:],
             )
-            non_spec_query_start_loc_cpu = torch.zeros(
-                num_decodes + num_prefills + 1, dtype=torch.int32
-            )
-            torch.cumsum(
-                query_lens_cpu[non_spec_req_idx_cpu],
-                dim=0,
-                out=non_spec_query_start_loc_cpu[1:],
-            )
 
-        assert num_accepted_tokens is not None
-        # Accepted-token counts must follow the same request order as the
-        # speculative state indices.
-        num_accepted_tokens = num_accepted_tokens[
-            spec_req_idx_cpu.to(num_accepted_tokens.device)
-        ]
+        if self.use_recoverssm:
+            # The commit left each window at the accepted position.
+            assert self.recoverssm_num_accepted_tokens is not None
+            num_accepted_tokens = self.recoverssm_num_accepted_tokens[:num_spec_decodes]
 
-        # Compute the conv-state slots for the non-spec decode/prefill split,
-        # plus the initial-state masks and Triton causal_conv1d metadata.
+        # Compute the conv-state slots for the non-spec decode/prefill split.
         if non_spec_state_indices_tensor is None:
             state_indices_tensor = block_table_tensor[:0, 0]
         else:
@@ -416,9 +466,8 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         state_indices_tensor_d = None
         if num_decodes > 0 or num_prefills > 0:
             num_computed_tokens = m.compute_num_computed_tokens()
-            if non_spec_req_idx_cpu is not None:
-                non_spec_req_idx = non_spec_req_idx_cpu.to(num_computed_tokens.device)
-                num_computed_tokens = num_computed_tokens[non_spec_req_idx]
+            assert non_spec_req_idx is not None
+            num_computed_tokens = num_computed_tokens[non_spec_req_idx]
 
             state_indices_tensor_d = state_indices_tensor[:num_decodes]
             state_indices_tensor_p = state_indices_tensor[
@@ -434,20 +483,9 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
                 ]
                 has_initial_states_p = num_computed_tokens_p > 0
                 assert non_spec_query_start_loc is not None
-                assert non_spec_query_start_loc_cpu is not None
                 query_start_loc_p = (
                     non_spec_query_start_loc[num_decodes:] - num_decode_tokens
                 )
-                query_start_loc_p_cpu = (
-                    non_spec_query_start_loc_cpu[num_decodes:] - num_decode_tokens
-                )
-                if query_start_loc.device.type != "cpu":
-                    nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                        compute_causal_conv1d_metadata(
-                            query_start_loc_p_cpu,
-                            device=query_start_loc.device,
-                        )
-                    )
 
         # Prepare persistent tensors for CUDA graph capture and replay.
         # ``m.num_actual_tokens`` is already padded by the model runner.
@@ -489,7 +527,37 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
-        return PleShortConvAttentionMetadata(
+        recoverssm_kwargs: dict[str, Any] = {}
+        if self.use_recoverssm:
+            align = None
+            if self.kv_cache_spec.mamba_cache_mode == "align":
+                align = RecoverSSMAlignMetadata(
+                    block_table=m.block_table_tensor,
+                    num_computed_tokens=m.compute_num_computed_tokens(),
+                    block_size=self.kv_cache_spec.block_size,
+                    tail_boundaries=self.decode_tail_boundaries,
+                    tail_blocks=self.decode_tail_blocks,
+                )
+            if self.recoverssm_context is None:
+                self.recoverssm_context = get_recoverssm_commit_context(
+                    self.vllm_config, self.layer_names
+                )
+            recoverssm_kwargs = dict(
+                recoverssm_commit=RecoverSSMCommitMetadata(
+                    state_indices=spec_state_indices_tensor,
+                    query_start_loc=spec_query_start_loc,
+                    request_indices=spec_req_idx,
+                    align=align,
+                ),
+                recoverssm_context=self.recoverssm_context,
+            )
+        metadata_cls = (
+            PleShortConvRecoverSSMAttentionMetadata
+            if self.use_recoverssm
+            else PleShortConvAttentionMetadata
+        )
+        return metadata_cls(
+            **recoverssm_kwargs,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
@@ -512,9 +580,6 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
-            nums_dict=nums_dict,
-            batch_ptr=batch_ptr,
-            token_chunk_offset_ptr=token_chunk_offset_ptr,
             query_start_loc_p=query_start_loc_p,
             query_start_loc_d=query_start_loc_d,
             state_indices_tensor_p=state_indices_tensor_p,

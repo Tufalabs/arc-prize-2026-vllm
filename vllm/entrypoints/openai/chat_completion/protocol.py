@@ -489,6 +489,23 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    zero_recurrent_state: bool = Field(
+        default=False,
+        description=(
+            "Hybrid (Mamba / linear-attention) models only: zero this "
+            "request's recurrent state at `zero_recurrent_at`, while the "
+            "attention KV cache still covers the whole prompt. See "
+            "SamplingParams.zero_recurrent_state."
+        ),
+    )
+    zero_recurrent_at: int | None = Field(
+        default=None,
+        description=(
+            "Absolute prompt position the blank lands on. Required with "
+            "zero_recurrent_state, and must be inside the prompt."
+        ),
+    )
+
     vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
         default=None,
         description=(
@@ -710,6 +727,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # Pass in ec_transfer_params via extra_args
             extra_args["ec_transfer_params"] = self.ec_transfer_params
         return SamplingParams.from_optional(
+            zero_recurrent_state=self.zero_recurrent_state,
+            zero_recurrent_at=self.zero_recurrent_at,
             n=self.n,
             presence_penalty=self.presence_penalty,
             frequency_penalty=self.frequency_penalty,

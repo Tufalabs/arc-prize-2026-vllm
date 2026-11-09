@@ -20,6 +20,29 @@ _QSA_CONFIG_FIELDS = (
 )
 
 
+def ple_layers_beyond_first_stage(
+    text_config: PretrainedConfig, pipeline_parallel_size: int
+) -> list[int]:
+    """The PLE layer ids (one-based, as the checkpoint states them) that a
+    split into ``pipeline_parallel_size`` stages would place after the first.
+
+    A PLE layer gathers its n-gram rows by the raw token ids, and only the
+    first pipeline stage receives those; every later stage sees hidden
+    states alone. So the architecture pipelines exactly when every PLE layer
+    falls inside the first stage. Empty means it does. The boundary follows
+    ``VLLM_PP_LAYER_PARTITION`` like the model's own layer split.
+    """
+    ple_layer_ids = list(getattr(text_config, "ple_layer_ids", None) or [])
+    if pipeline_parallel_size <= 1 or not ple_layer_ids:
+        return []
+    from vllm.distributed.utils import get_pp_indices
+
+    _, first_stage_end = get_pp_indices(
+        int(text_config.num_hidden_layers), 0, pipeline_parallel_size
+    )
+    return [ple_id for ple_id in ple_layer_ids if ple_id - 1 >= first_stage_end]
+
+
 class Qwen4ExpVisionConfig(Qwen3VLVisionConfig):
     model_type = "qwen4_exp"
     base_config_key = "vision_config"

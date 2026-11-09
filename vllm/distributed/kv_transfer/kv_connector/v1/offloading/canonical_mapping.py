@@ -432,6 +432,10 @@ def derive_canonical_mappings(
 
     mappings: dict[str, CanonicalPageMapping] = {}
     for kv_cache_group in kv_cache_config.kv_cache_groups:
+        if kv_cache_group.transient_pool:
+            # Never transferred, and its tensors hold the transient pool's
+            # block count, not num_blocks.
+            continue
         group_kv_cache_spec = kv_cache_group.kv_cache_spec
         if isinstance(group_kv_cache_spec, UniformTypeKVCacheSpecs):
             per_layer_specs = group_kv_cache_spec.kv_cache_specs

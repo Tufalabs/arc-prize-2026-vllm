@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -15,6 +16,12 @@ class AsyncScheduler(Scheduler):
         # reusable read-only placeholder list for speculative decoding.
         self._spec_token_placeholders: list[int] = [-1] * self.num_spec_tokens
         self.pp_size = self.parallel_config.pipeline_parallel_size
+        # Balanced micro-batches ride the decode cadence below.
+        self.pp_balanced_micro_batches = (
+            self.use_pp
+            and self.use_v2_model_runner
+            and envs.VLLM_PP_BALANCED_MICRO_BATCHES
+        )
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)

@@ -876,11 +876,18 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             )
         # Checked again in Qwen4ExpModelState; rejecting it here keeps the
         # engine from loading weights first.
-        if text_config.ple_layer_ids and parallel_config.pipeline_parallel_size > 1:
+        from vllm.models.qwen4_exp.config import ple_layers_beyond_first_stage
+
+        beyond = ple_layers_beyond_first_stage(
+            text_config, parallel_config.pipeline_parallel_size
+        )
+        if beyond:
             raise NotImplementedError(
-                "Qwen4Exp N-gram PLE embedding requires pipeline_parallel_size=1 "
-                "because non-first pipeline ranks do not receive the raw input_ids "
-                "it needs. Please run with PP=1."
+                f"Qwen4Exp N-gram PLE layers {beyond} would fall after the first "
+                f"pipeline stage at pipeline_parallel_size="
+                f"{parallel_config.pipeline_parallel_size}, and only the first "
+                "stage receives the raw input_ids PLE gathers by. Move the stage "
+                "boundary with VLLM_PP_LAYER_PARTITION or use fewer stages."
             )
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is not None and multimodal_config.language_model_only:

@@ -34,6 +34,7 @@ from .device import DeviceConfig
 from .diffusion import DiffusionConfig
 from .ec_manager_config import EncoderCacheManagerConfig
 from .ec_transfer import ECTransferConfig
+from .engram import EngramConfig
 from .kernel import KernelConfig
 from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
@@ -90,6 +91,9 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "KimiLinearForCausalLM",
         "MiniMaxM3SparseForCausalLM",
         "MiniMaxM3SparseForConditionalGeneration",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen4ExpMTP",
     }
 )
 
@@ -363,6 +367,8 @@ class VllmConfig:
     """Model weight offloading configuration."""
     attention_config: AttentionConfig = Field(default_factory=AttentionConfig)
     """Attention configuration."""
+    engram_config: EngramConfig | None = None
+    """Optional Engram configuration, only valid for supported PLE models."""
     mamba_config: MambaConfig = Field(default_factory=MambaConfig)
     """Mamba configuration."""
     kernel_config: KernelConfig = Field(default_factory=KernelConfig)
@@ -495,6 +501,11 @@ class VllmConfig:
             vllm_factors.append(self.attention_config.compute_hash())
         else:
             vllm_factors.append("None")
+        vllm_factors.append(
+            self.engram_config.compute_hash()
+            if self.engram_config is not None
+            else "None"
+        )
         if self.lora_config:
             vllm_factors.append(self.lora_config.compute_hash())
         else:
@@ -1072,6 +1083,25 @@ class VllmConfig:
         if not self.use_v2_model_runner:
             raise ValueError("trace replay requires Model Runner V2")
 
+    def _resolve_and_verify_engram_config(self) -> None:
+        """Resolve legacy offload settings and validate model and parallel configs."""
+        if self.engram_config is None:
+            if not envs.VLLM_PLE_CPU_OFFLOAD:
+                return
+            self.engram_config = EngramConfig()
+        model_config = self.model_config
+        speculative_config = self.speculative_config
+        # Draft configs inherit the target's communication groups and settings.
+        # Qwen4Exp MTP itself disables PLE, so validate its target instead.
+        if (
+            speculative_config is not None
+            and model_config is speculative_config.draft_model_config
+        ):
+            model_config = speculative_config.target_model_config
+        self.engram_config.verify_model_config(model_config)
+        self.engram_config.verify_parallel_config(self.parallel_config)
+        logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -1084,6 +1114,7 @@ class VllmConfig:
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
         self.try_verify_and_update_config()
+        self._resolve_and_verify_engram_config()
 
         # Models may have supplied their own DCP defaults above; anything still
         # unset falls back to the stock ones.
@@ -2582,12 +2613,6 @@ class VllmConfig:
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 
-            if (
-                speculative_config.method == "eagle3"
-                and self.parallel_config.pipeline_parallel_size > 1
-            ):
-                unsupported.append("EAGLE3 with pipeline parallelism")
-
         if self.parallel_config.enable_dbo:
             unsupported.append("dual batch overlap")
 
@@ -2900,6 +2925,40 @@ class VllmConfig:
                 "--use-replayssm is incompatible with KV connectors "
                 "(P/D disaggregation, KV cache offload)"
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_gdn_recoverssm(self) -> "VllmConfig":
+        requested = (
+            self.speculative_config is not None
+            and self.speculative_config.gdn_recoverssm
+        )
+        self.cache_config.use_gdn_recoverssm = (
+            requested and self.num_speculative_tokens > 0
+        )
+        if not requested:
+            return self
+        if not self.cache_config.use_gdn_recoverssm:
+            raise ValueError("GDN RecoverSSM requires speculative tokens")
+        if self.cache_config.use_kda_recoverssm:
+            raise ValueError("GDN RecoverSSM and KDA RecoverSSM are exclusive")
+        if self.model_config is not None and self.model_config.architecture not in (
+            "Qwen4ExpForCausalLM",
+            "Qwen4ExpForConditionalGeneration",
+            # The MTP drafter's config (Qwen4Exp's _make_draft_vllm_config)
+            # is revalidated with the draft model config; it has no GDN.
+            "Qwen4ExpMTP",
+        ):
+            raise ValueError("GDN RecoverSSM is only supported for Qwen4Exp")
+        if self.cache_config.mamba_cache_mode not in ("none", "align"):
+            raise ValueError(
+                "GDN RecoverSSM supports only none and align Mamba cache modes"
+            )
+        if not self.use_v2_model_runner:
+            raise ValueError("GDN RecoverSSM requires VLLM_USE_V2_MODEL_RUNNER=1")
+        # Under pipeline parallelism a stage before the last commits a step
+        # when the last stage's acceptance for it arrives, pp_size steps on
+        # (RecoverSSMState.take_deferred_step).
         return self
 
 

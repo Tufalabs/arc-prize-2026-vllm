@@ -809,6 +809,38 @@ def test_hash_tokens_different_mm_input(hash_fn):
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
+def test_hash_prompt_tail_with_mm_inputs_completed_by_decode(hash_fn):
+    # The prompt's partial last block carries two mm inputs; decode completes
+    # it. It must hash as it does for a longer prompt with the same tokens,
+    # or a follow-up request misses it and everything after.
+    mm_positions = [
+        PlaceholderRange(offset=6, length=1),
+        PlaceholderRange(offset=7, length=1),
+    ]
+    first = make_request(
+        request_id="0",
+        prompt_token_ids=list(range(8)),
+        block_size=3,
+        hash_fn=hash_fn,
+        mm_positions=mm_positions,
+        mm_hashes=["hash1", "hash2"],
+    )
+    for token in (100, 101):
+        first.append_output_token_ids(token)
+    follow_up = make_request(
+        request_id="1",
+        prompt_token_ids=list(range(8)) + [100, 101, 102],
+        block_size=3,
+        hash_fn=hash_fn,
+        mm_positions=mm_positions,
+        mm_hashes=["hash1", "hash2"],
+    )
+
+    assert len(first.block_hashes) == 3
+    assert first.block_hashes == follow_up.block_hashes[:3]
+
+
+@pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
 def test_hash_request_tokens_no_mm_inputs(hash_fn):
     request = make_request(
         request_id="0",
@@ -1277,6 +1309,31 @@ def test_get_kv_cache_configs_pp_sharding(asymmetric_memory):
             kv_cache_groups=[KVCacheGroupSpec(["layer2"], ref_kv_cache_spec)],
         ),
     ]
+
+
+def test_max_worker_kv_bytes_per_block_is_the_largest_stage_block():
+    """Pipeline stages that hold different layers lay out blocks of different
+    sizes; the engine core hands every worker the largest."""
+
+    def config(num_blocks: int, size: int) -> KVCacheConfig:
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=size, layers=["layer"], layer_stride=0, block_stride=0
+                )
+            ],
+            kv_cache_groups=[],
+        )
+
+    configs = [config(4, 64), config(4, 96)]
+    assert kv_cache_utils.get_max_worker_kv_bytes_per_block(configs) == 24
+    assert (
+        kv_cache_utils.get_max_worker_kv_bytes_per_block(
+            [KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[])]
+        )
+        is None
+    )
 
 
 def test_project_kv_cache_groups_to_worker():
@@ -3290,12 +3347,14 @@ def _spec_decode_grouping_config(method="dspark", model_type=None):
         cache_config=SimpleNamespace(
             get_resolved_kv_cache_layout=lambda: SimpleNamespace(
                 is_block_outermost=True
-            )
+            ),
+            transient_kv_pool=False,
         ),
         model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
         speculative_config=SimpleNamespace(
             method=method,
             use_eagle=lambda: True,
+            use_eagle_block_drop=lambda: True,
         ),
     )
 

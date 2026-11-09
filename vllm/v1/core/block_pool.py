@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -23,9 +23,13 @@ from vllm.v1.core.kv_cache_utils import (
     get_group_id,
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
+    request_context,
     resolve_block_hashes,
 )
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.core.context_threads import ContextThreads
 
 logger = init_logger(__name__)
 
@@ -140,6 +144,11 @@ class BlockHashToBlockMap:
         raise AssertionError(f"Invalid KV cache block type {type(blocks)}")
 
 
+def _context_id(request: Request) -> str | None:
+    tag = request_context(request)
+    return tag[0] if tag is not None else None
+
+
 class BlockPool:
     """BlockPool that manages KVCacheBlocks.
     It provides methods to allocate, free and cache the kv cache blocks. The
@@ -192,6 +201,10 @@ class BlockPool:
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
+        # CacheConfig.prefix_cache_context_threads, set by the KV cache
+        # manager: which cached blocks make up each context's live thread,
+        # for a host tier bound to this pool.
+        self.context_threads: ContextThreads | None = None
 
         self.metrics_collector = metrics_collector
 
@@ -259,6 +272,7 @@ class BlockPool:
         if num_cached_blocks >= num_full_blocks:
             return
         new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
+        context = _context_id(request)
         assert block_mask is None or len(block_mask) == len(new_full_blocks)
         block_hashes = resolve_block_hashes(
             request.block_hashes, self.hash_block_size, block_size
@@ -295,6 +309,8 @@ class BlockPool:
                 blk,
                 num_tokens=num_hash_tokens,
             )
+            if blk.context is None:
+                blk.context = context
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -510,6 +526,8 @@ class BlockPool:
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
+        if block.context is None:
+            block.context = _context_id(request)
         if self.enable_kv_cache_events and not already_cached:
             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
                 request, num_tokens
@@ -643,6 +661,71 @@ class BlockPool:
         for block_hash in self._remove_cached_block_hashes(src_block):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
+        dst_block.context = src_block.context
+        dst_block.context_shared = src_block.context_shared
+
+    def retire_cached_block(
+        self,
+        block: KVCacheBlock,
+        block_hash: BlockHashWithGroupId,
+    ) -> None:
+        """Retire a prefix-cache entry its owner has superseded.
+
+        Uncaches ``block`` if it still carries ``block_hash`` (it may have been
+        evicted and reused since), and if it is idle moves it to the front of
+        the free queue, as a freed uncached block goes: the next allocation
+        reuses it instead of evicting a cached block.
+        """
+        if block.is_null or block.block_hash != block_hash:
+            return
+        self._maybe_evict_cached_block(block)
+        if block.ref_cnt == 0:
+            self.free_block_queue.remove(block)
+            self.free_block_queue.prepend_n([block])
+
+    def evict_first_context_block(
+        self,
+        block: KVCacheBlock,
+        block_hash: BlockHashWithGroupId,
+        context: str,
+    ) -> bool:
+        """Send an idle cached block of a context's dead thread to the
+        eviction end, still cached (``CacheConfig.prefix_cache_context_threads``):
+        only while it still carries ``block_hash``, the context cached it and
+        no other context has taken it as a hit. Returns whether it moved."""
+        if (
+            block.is_null
+            or block.ref_cnt > 0
+            or block.block_hash != block_hash
+            or block.context != context
+            or block.context_shared
+        ):
+            return False
+        self.free_block_queue.remove(block)
+        self.free_block_queue.prepend_n([block])
+        block.dead = True
+        return True
+
+    def supersede_cached_block(
+        self,
+        block: KVCacheBlock,
+        block_hash: BlockHashWithGroupId,
+    ) -> None:
+        """Send a cached block its owner has superseded to the eviction end,
+        still cached (``CacheConfig.prefix_cache_evict_superseded_first``).
+
+        Only while it still carries ``block_hash`` (it may have been evicted
+        and reused since). An idle block moves now; a referenced one moves
+        when the free that leaves it unreferenced comes.
+        """
+        if block.is_null or block.block_hash != block_hash or block.num_hits > 1:
+            return
+        if block.ref_cnt == 0:
+            self.free_block_queue.remove(block)
+            self.free_block_queue.prepend_n([block])
+            block.dead = True
+        else:
+            block.superseded = True
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
@@ -713,6 +796,7 @@ class BlockPool:
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
+            block.dead = False
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -731,17 +815,27 @@ class BlockPool:
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last = []
         blocks_to_evict_first = []
+        blocks_superseded = []
         for block in ordered_blocks:
             block.ref_cnt -= 1
+            superseded = block.superseded
+            block.superseded = False
             if block.ref_cnt == 0 and not block.is_null:
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
+                elif superseded and block.num_hits <= 1:
+                    # Cached, but its owner has moved past it and no other
+                    # conversation shares it: evicted before any live block.
+                    block.dead = True
+                    blocks_superseded.append(block)
                 else:
                     # FIFO reuse of cached blocks for LRU eviction behavior.
                     blocks_to_evict_last.append(block)
 
-        # Blocks to reuse first are prepended to the front of the free queue.
+        # Blocks to reuse first are prepended to the front of the free queue,
+        # ahead of superseded cached blocks, which go ahead of every other.
+        self.free_block_queue.prepend_n(blocks_superseded)
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)

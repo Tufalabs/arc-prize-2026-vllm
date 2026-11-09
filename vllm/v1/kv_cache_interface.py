@@ -993,6 +993,16 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         return merged_spec
 
 
+def is_transient_spec(spec: KVCacheSpec) -> bool:
+    """A ring of per-request scratch state the core never prefix-caches:
+    a CircularBufferSpec, bare or as the uniform type of a layer group."""
+    if isinstance(spec, CircularBufferSpec):
+        return True
+    return isinstance(spec, UniformTypeKVCacheSpecs) and all(
+        isinstance(s, CircularBufferSpec) for s in spec.kv_cache_specs.values()
+    )
+
+
 @dataclass(frozen=True)
 class UniformTypeKVCacheSpecs(KVCacheSpec):
     """
@@ -1183,6 +1193,11 @@ class KVCacheTensor:
     layer_stride: int
     block_stride: int
     offset: int = 0  # byte offset of layers[0]'s block 0
+    # Blocks this tensor holds when it is not the shared pool's: a group in the
+    # transient pool (``CacheConfig.transient_kv_pool``) has an allocation of
+    # its own, of ``KVCacheConfig.num_transient_blocks`` blocks. None: the
+    # shared allocation's ``KVCacheConfig.num_blocks``.
+    num_blocks: int | None = None
 
 
 @dataclass
@@ -1200,6 +1215,9 @@ class KVCacheGroupSpec:
     is_eagle_group: bool = False
     # Whether this group is part of the externally transferable KV state.
     enable_kv_transfer: bool = True
+    # Whether this group's blocks come from the transient pool, outside the
+    # shared one (``CacheConfig.transient_kv_pool``): a per-request ring.
+    transient_pool: bool = False
 
 
 @dataclass
@@ -1222,8 +1240,33 @@ class KVCacheConfig:
     """
     prefix_cache_retention_interval: int | None = None
     """Resolved retention policy for local prefix-cache checkpoints."""
+    prefix_cache_decode_tail: bool = False
+    """Keep a prefix-cache entry at each decoding request's latest hash
+    boundary (``CacheConfig.prefix_cache_decode_tail``)."""
+    decode_tail_mode: str | None = "copy"
+    """How decode tails are taken: ``"copy"`` (one token a step: the running
+    state is copied at each boundary), ``"recover"`` (speculative decoding
+    under GDN RecoverSSM: its commit writes the state at the boundary a
+    verify window crosses), or None (speculative decoding without it: no
+    decode tails)."""
+    prefix_cache_evict_superseded_first: bool = False
+    """Evict superseded cached blocks before live ones
+    (``CacheConfig.prefix_cache_evict_superseded_first``)."""
+    prefix_cache_context_threads: bool = False
+    """Put each client context's dead variants at the eviction end
+    (``CacheConfig.prefix_cache_context_threads``)."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
+    max_worker_kv_bytes_per_block: int | None = None
+    """The most KV bytes a block takes on any worker, resolved by the engine core
+    and adopted by all workers. Pipeline stages that hold different layers lay out
+    blocks of different sizes; a store the workers share (the offloading
+    connector's host region) needs one slot size that fits every stage's block."""
+    num_transient_blocks: int = 0
+    """Blocks in the transient pool (``CacheConfig.transient_kv_pool``), the
+    null block 0 included: the groups marked ``transient_pool`` take theirs
+    from it, each block their own bytes rather than the shared pool's widest
+    group's. 0: no transient pool."""
 
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:

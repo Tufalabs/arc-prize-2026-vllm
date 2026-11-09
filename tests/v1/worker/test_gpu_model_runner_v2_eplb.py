@@ -185,6 +185,8 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):
         routed_experts=None,
     )
     runner.req_states = SimpleNamespace()
+    # No RecoverSSM step waits for this step's acceptance.
+    runner.model_state = SimpleNamespace(take_deferred_postprocess=lambda: None)
 
     def fake_receive(*args, **kwargs):
         events.append("receive")

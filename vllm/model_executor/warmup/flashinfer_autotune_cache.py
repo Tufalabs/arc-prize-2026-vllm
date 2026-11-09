@@ -22,6 +22,11 @@ def flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
 
 
 def resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
+    explicit_file = envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_FILE
+    if explicit_file:
+        path = Path(explicit_file).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
     override_dir = envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR
     if override_dir:
         root = Path(override_dir).expanduser()

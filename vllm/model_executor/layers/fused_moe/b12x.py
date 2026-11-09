@@ -109,6 +109,14 @@ def _run_b12x_moe_plan(
 ) -> None:
     fused_moe = _require_b12x_fused_moe()
 
+    # b12x indexes the expert tables with these ids and does not bound them,
+    # so an id past the expert count reads off the end. Routing never produces
+    # one, but CUDA graph capture runs the model over dummy input buffers that
+    # no router has written, and the illegal access takes the engine down
+    # during capture (the warm-up path below bounds the ids it invents for the
+    # same reason). In place: capture forbids allocating.
+    topk_ids.remainder_(int(prepared.num_experts))
+
     binding = fused_moe.bind(
         plan,
         scratch=scratch,

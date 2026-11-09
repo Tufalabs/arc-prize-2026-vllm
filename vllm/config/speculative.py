@@ -436,6 +436,16 @@ class SpeculativeConfig:
     speculative input batches can contain sequences of different lengths,
     which may only be supported by certain attention backends. This currently
     only affects the EAGLE method of speculation."""
+    disable_eagle_block_drop: bool = False
+    """Disable dropping the trailing prefix-cache block for EAGLE-like
+    speculative methods. This is an experimental option for measuring the
+    acceptance-rate impact of reusing that block. It does not disable the
+    speculative drafter itself."""
+    gdn_recoverssm: bool = False
+    """Verify GatedDeltaNet speculative windows with RecoverSSM: from the
+    unmodified checkpoint, recording per position what the accepted state
+    needs, instead of writing a recurrent state per draft token. Every Mamba
+    group then keeps no per-draft-token state blocks. Qwen4Exp only."""
     use_local_argmax_reduction: bool = False
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
@@ -534,6 +544,21 @@ class SpeculativeConfig:
     """Whether to adaptively size the draft-verification budget from per-request
     confidence. Currently only supported for method="dspark"."""
 
+    accept_threshold_single: float = 1.0
+    """Relaxed acceptance, SGLang's --speculative-accept-threshold-single: a
+    draft token the target gives at least this probability is accepted
+    outright. In (0, 1]; 1.0 keeps verification exact. Lossy at temperature
+    above zero (sampling sharpens toward the draft); greedy requests verify
+    exactly. Model Runner V2's standard rejection sampling only."""
+
+    accept_threshold_acc: float = 1.0
+    """Relaxed acceptance, SGLang's --speculative-accept-threshold-acc: the
+    probability ratio test accepts when u * threshold * q(x) < p(x), so with
+    probability min(1, p / (threshold * q)) (q is 1 for a greedy draft, which
+    is SGLang's target-only rule). In (0, 1]; 1.0 keeps verification exact.
+    Lossy at temperature above zero; greedy requests verify exactly. Model
+    Runner V2's standard rejection sampling only."""
+
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
         """Mean acceptance length to unconditional per-position rates, using
@@ -586,6 +611,16 @@ class SpeculativeConfig:
     distribution and uses the full draft logits for the probability ratio test
     during rejection sampling. This comes at the cost of additional GPU memory
     usage."""
+
+    draft_top_k_top_p: bool = False
+    """With draft_sample_method='probabilistic', draw each draft token from
+    the drafter's distribution under the request's own top_k and top_p, as
+    the target sampler applies them after temperature, instead of under
+    temperature alone. Rejection sampling verifies against the target's
+    processed distribution either way, so the output distribution is
+    unchanged; a proposal cut to the same nucleus is what the target can
+    accept, which raises acceptance for requests that sample with top_k or
+    top_p. Costs one top-k/top-p pass over the draft logits per draft step."""
 
     dspark_draft_topk: int | None = Field(default=None, ge=1)
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
@@ -1235,7 +1270,23 @@ class SpeculativeConfig:
                     draft_hf_overrides = SpeculativeConfig.compose_draft_hf_overrides(
                         self.target_model_config.hf_overrides
                     )
+                # The target's multimodal settings, as it resolved them: a
+                # drafter checkpoint can carry the full multimodal config
+                # (Qwen4Exp's MTP head does), and must not profile or cache
+                # what the target was told not to.
+                target_mm = self.target_model_config.multimodal_config
+                draft_mm_kwargs: dict[str, Any] = (
+                    {}
+                    if target_mm is None
+                    else dict(
+                        language_model_only=target_mm.language_model_only,
+                        skip_mm_profiling=target_mm.skip_mm_profiling,
+                        mm_processor_cache_gb=target_mm.mm_processor_cache_gb,
+                        mm_processor_cache_type=target_mm.mm_processor_cache_type,
+                    )
+                )
                 self.draft_model_config = ModelConfig(
+                    **draft_mm_kwargs,
                     model=self.model,
                     runner="draft",
                     tokenizer=(
@@ -1256,6 +1307,13 @@ class SpeculativeConfig:
                     spec_target_max_model_len=self.target_model_config.max_model_len,
                     quantization=self.quantization,
                     enforce_eager=self.target_model_config.enforce_eager,
+                    # The target's, as it resolved it: one allocator serves
+                    # the engine's KV cache, drafter layers included; a draft
+                    # VllmConfig revalidated with this model config
+                    # (Qwen4Exp's _make_draft_vllm_config) must see it, or
+                    # the KV-connector + expandable_segments check refuses a
+                    # configuration the target passed.
+                    enable_cumem_allocator=self.target_model_config.enable_cumem_allocator,
                     max_logprobs=self.target_model_config.max_logprobs,
                     hf_overrides=draft_hf_overrides,
                     config_format=self.target_model_config.config_format,
@@ -1687,7 +1745,7 @@ class SpeculativeConfig:
         This is mostly a copy of the target parallel config, except the tp_size.
         """
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
+            pipeline_parallel_size=1,
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
@@ -1745,6 +1803,19 @@ class SpeculativeConfig:
                 "are only valid with rejection_sample_method='synthetic'."
             )
 
+        for name in ("accept_threshold_single", "accept_threshold_acc"):
+            threshold = getattr(self, name)
+            if not 0.0 < threshold <= 1.0:
+                raise ValueError(f"{name} must be in (0, 1], got {threshold}.")
+        if (
+            self.uses_relaxed_acceptance()
+            and self.rejection_sample_method != "standard"
+        ):
+            raise ValueError(
+                "accept_threshold_single / accept_threshold_acc below 1.0 are "
+                "only valid with rejection_sample_method='standard'."
+            )
+
         if self.draft_model_config:
             self.draft_model_config.verify_with_parallel_config(
                 self.draft_parallel_config
@@ -1760,6 +1831,12 @@ class SpeculativeConfig:
                 "use_heterogeneous_vocab currently only supports greedy draft "
                 "sampling. Set draft_sample_method='greedy' (the default) or "
                 "omit it."
+            )
+
+        if self.draft_top_k_top_p and self.draft_sample_method != "probabilistic":
+            raise ValueError(
+                "draft_top_k_top_p shapes the distribution draft tokens are "
+                "sampled from, so it needs draft_sample_method='probabilistic'."
             )
 
         if not self.use_heterogeneous_vocab:
@@ -1846,6 +1923,10 @@ class SpeculativeConfig:
         # TODO(ben): Refactor this so the naming is clearer
         return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
 
+    def use_eagle_block_drop(self) -> bool:
+        """Whether volatile trailing cache blocks should be discarded."""
+        return self.use_eagle() and not self.disable_eagle_block_drop
+
     def use_dflash(self) -> bool:
         return self.method == "dflash"
 
@@ -1857,6 +1938,9 @@ class SpeculativeConfig:
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"
+
+    def uses_relaxed_acceptance(self) -> bool:
+        return self.accept_threshold_single < 1.0 or self.accept_threshold_acc < 1.0
 
     def uses_extract_hidden_states(self) -> bool:
         return self.method == "extract_hidden_states"

@@ -221,6 +221,40 @@ def stream_delta_message_generator(
         read_offset = new_read_offset
 
 
+def test_extract_tool_calls_converts_a_long_call_once(qwen3_tool_parser):
+    """A one-pass parse converts a call's arguments at its end, not once per
+    argument chunk as a stream does: those conversions grow with the call, so
+    a long one took seconds, and the pass keeps only the last."""
+    code = "".join(
+        f"if grid[{i}] > 3 and grid[{i}] < 7:\n    out.append({i})\n"
+        for i in range(400)
+    )
+    output = (
+        "<tool_call>\n<function=get_current_weather>\n<parameter=city>\n"
+        f"{code}\n</parameter>\n<parameter=state>\nTX\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    engine = qwen3_tool_parser._parser_engine
+    converter = engine._arg_converter
+    conversions = 0
+
+    def counted(raw_args: str, partial: bool) -> str:
+        nonlocal conversions
+        conversions += 1
+        return converter(raw_args, partial)
+
+    engine._arg_converter = counted
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+    extracted = qwen3_tool_parser.extract_tool_calls(output, request=request)
+
+    assert extracted.tools_called
+    (call,) = extracted.tool_calls
+    assert json.loads(call.function.arguments) == {"city": code, "state": "TX"}
+    assert conversions <= 2
+    # A stream still gets its argument deltas.
+    assert engine._stream_arg_deltas
+
+
 def test_extract_tool_calls_no_tools(qwen3_tool_parser):
     model_output = "This is a test response without any tool calls"
     extracted_tool_calls = qwen3_tool_parser.extract_tool_calls(

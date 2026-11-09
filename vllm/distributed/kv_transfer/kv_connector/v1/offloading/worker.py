@@ -77,6 +77,10 @@ class OffloadingConnectorWorker:
         # layer_name -> size of page in bytes
         page_size_bytes: dict[str, int] = {}
         for kv_cache_group in kv_cache_config.kv_cache_groups:
+            if kv_cache_group.transient_pool:
+                # Its own allocation, of its own block count, and never
+                # transferred: the scheduler side leaves transient groups out.
+                continue
             group_layer_names = kv_cache_group.layer_names
             group_kv_cache_spec = kv_cache_group.kv_cache_spec
             if isinstance(group_kv_cache_spec, UniformTypeKVCacheSpecs):

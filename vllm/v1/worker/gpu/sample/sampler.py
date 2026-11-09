@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import numpy as np
 import torch
 
@@ -13,6 +15,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     flashinfer_sample,
     flashinfer_sampler_supported,
 )
+from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
@@ -27,6 +30,7 @@ from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
+from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import VOCAB_BLOCK_SIZE
 from vllm.v1.worker.gpu.states import RequestState
 
 
@@ -59,6 +63,23 @@ class Sampler:
             TraceReplayState(req_states) if enable_trace_replay else None
         )
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
+        # XKB_SAMPLER_FOLD=1: when a batch's rows need only a temperature and
+        # a top-k, the top-k kernel reads the model's logits and writes the
+        # scaled, masked fp32 row itself, without the fp32 copy and the
+        # temperature pass; 2 also has it write the target's tile statistics
+        # for the rejection sampler (fused_target_stats).
+        self.fold_level = int(os.environ.get("XKB_SAMPLER_FOLD", "0") or 0)
+        self.needs_other_processing = np.zeros(max_num_reqs, dtype=bool)
+        self.fused_target_stats: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None
+        # XKB_SPARSE_SAMPLER: the rejection sampler sets fold_cand to a list
+        # size to have the fold (level 2) list each row's kept tokens in
+        # fused_target_cand instead of writing rows that fit.
+        self.fold_cand = 0
+        self.fused_target_cand: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -90,6 +111,19 @@ class Sampler:
             or (temperature != 0.0 and temperature != 1.0)
             or states.min_p.np[req_idx] != 0.0
             or states.top_k.np[req_idx] != states.vocab_size
+            or states.top_p.np[req_idx] != 1.0
+        )
+        # What the fold cannot do: in-place edits before the temperature,
+        # min_p, and top_p.
+        self.needs_other_processing[req_idx] = (
+            self.logit_bias_state.use_logit_bias[req_idx]
+            or self.penalties_state.use_penalty[req_idx]
+            or self.bad_words_state.num_bad_words.np[req_idx] > 0
+            or (
+                self.thinking_budget_state.enabled
+                and self.thinking_budget_state.use_thinking_budget[req_idx]
+            )
+            or states.min_p.np[req_idx] != 0.0
             or states.top_p.np[req_idx] != 1.0
         )
 
@@ -215,8 +249,23 @@ class Sampler:
         expanded_local_pos: torch.Tensor,
         skip_top_k_top_p: bool = False,
     ) -> torch.Tensor:
+        # Reset before any return: the rejection sampler reads it right after
+        # this call and must never see a previous batch's statistics.
+        self.fused_target_stats = None
+        self.fused_target_cand = None
         if not np.any(self.needs_logits_processing[idx_mapping_np]):
             return logits
+
+        if (
+            self.fold_level
+            and not skip_top_k_top_p
+            and not np.any(self.needs_other_processing[idx_mapping_np])
+        ):
+            top_k, top_p = self.sampling_states.get_top_k_top_p(
+                expanded_idx_mapping, idx_mapping_np
+            )
+            if top_k is not None and top_p is None:
+                return self._fold_sampling_params(logits, expanded_idx_mapping, top_k)
 
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
@@ -270,6 +319,53 @@ class Sampler:
         return self.sampling_states.apply_top_k_top_p(
             logits, expanded_idx_mapping, idx_mapping_np
         )
+
+    def _fold_sampling_params(
+        self,
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        top_k: torch.Tensor,
+    ) -> torch.Tensor:
+        """The fp32 copy, the temperature and the top-k in one pass of the
+        top-k kernel (XKB_SAMPLER_FOLD); level 2 also leaves the target's tile
+        statistics in fused_target_stats for the rejection sampler."""
+        out = torch.empty(logits.shape, dtype=torch.float32, device=logits.device)
+        stats = None
+        if self.fold_level >= 2:
+            num_tiles = -(-logits.shape[1] // VOCAB_BLOCK_SIZE)
+            stats = (
+                out.new_empty(logits.shape[0], num_tiles, dtype=torch.int64),
+                out.new_empty(logits.shape[0], num_tiles),
+                out.new_empty(logits.shape[0], num_tiles),
+            )
+        cand = None
+        if self.fold_cand and stats is not None:
+            cand = (
+                torch.empty(
+                    logits.shape[0],
+                    self.fold_cand,
+                    dtype=torch.int32,
+                    device=logits.device,
+                ),
+                out.new_empty(logits.shape[0], self.fold_cand),
+                torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device),
+            )
+        apply_top_k_top_p_triton(
+            logits,
+            top_k,
+            None,
+            fold=(
+                out,
+                self.sampling_states.temperature.gpu,
+                expanded_idx_mapping,
+                stats,
+            ),
+            cand=cand,
+            cand_fast=cand is not None,
+        )
+        self.fused_target_stats = stats
+        self.fused_target_cand = cand
+        return out
 
     def sample(
         self,

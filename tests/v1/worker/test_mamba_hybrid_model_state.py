@@ -12,6 +12,7 @@ from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMMetadata,
     RecoverSSMPostprocessMetadata,
 )
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 
@@ -94,3 +95,58 @@ def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias() -
     assert state._mamba_state_idx_gpu.tolist() == expected_state_indices
     expected_accepted = [9, 1, 9, 2, 9]
     assert state.num_accepted_tokens_gpu.tolist() == expected_accepted
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_decode_tail_targets_reach_each_groups_builders() -> None:
+    """Each recurrent group keeps its own decode-tail targets per request
+    slot, and its builders get them per batch row: a group with no target for
+    a request passes none for it, and a cleared target passes none."""
+    state = object.__new__(MambaHybridModelState)
+    state._align_mode = True
+    state.max_num_reqs = 4
+    state.device = torch.device("cuda")
+    state.recoverssm = RecoverSSMState()
+    state._tail_tables = {}
+    slots = {"a": 3, "b": 0}
+    state.set_decode_tail_targets(
+        {
+            "a": {1: (72, 10), 2: (72, 11)},
+            "b": {1: (136, 12)},
+            "finished": {1: (8, 13)},
+        },
+        slots,
+    )
+    builders = {
+        group_id: SimpleNamespace(decode_tail_boundaries=None, decode_tail_blocks=None)
+        for group_id in (1, 2, 3)
+    }
+    attn_groups: list[list[SimpleNamespace]] = [[]] + [
+        [SimpleNamespace(get_metadata_builder=lambda _, b=builders[g]: b)]
+        for g in (1, 2, 3)
+    ]
+    # Batch rows: b, a, and a padding row.
+    input_batch = SimpleNamespace(
+        num_reqs=2, idx_mapping=torch.tensor([0, 3], dtype=torch.int32, device="cuda")
+    )
+
+    def handed(for_capture: bool = False) -> dict:
+        state._set_decode_tail_builders(
+            input_batch, 3, [1, 2, 3], attn_groups, for_capture=for_capture
+        )
+        return {
+            group_id: None
+            if b.decode_tail_boundaries is None
+            else (b.decode_tail_boundaries.tolist(), b.decode_tail_blocks.tolist())
+            for group_id, b in builders.items()
+        }
+
+    null = NULL_BLOCK_ID
+    assert handed() == {
+        1: ([136, 72, 0], [12, 10, null]),
+        2: ([0, 72, 0], [null, 11, null]),
+        3: None,
+    }
+    state.set_decode_tail_targets({"a": {1: (0, 0)}}, slots)
+    assert handed()[1] == ([136, 0, 0], [12, null, null])
+    assert handed(for_capture=True) == {1: None, 2: None, 3: None}

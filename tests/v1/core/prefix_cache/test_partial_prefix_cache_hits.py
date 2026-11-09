@@ -45,18 +45,22 @@ def test_connector_without_divergent_hit_support_uses_common_lookup():
 
     result = Scheduler._get_local_prefix_cache_hit(scheduler, MagicMock())
 
-    assert result == (common_blocks, 0, 0, False)
+    assert result == (common_blocks, 0, 0, ())
     manager.get_computed_blocks_for_connector.assert_not_called()
 
 
 def test_capable_connector_uses_divergent_partial_hit_lookup():
     per_group_blocks = MagicMock()
     manager = MagicMock()
+    # A divergent hit reports the per-group hit lengths, which the scheduler
+    # reads group by group to decide what a connector must fill; they have to
+    # come through the helper untouched.
+    per_group_hits = (6, 2)
     manager.get_computed_blocks_for_connector.return_value = (
         per_group_blocks,
         6,
         0,
-        True,
+        per_group_hits,
     )
     scheduler = SimpleNamespace(
         connector=SimpleNamespace(supports_divergent_local_hybrid_hits=True),
@@ -65,7 +69,7 @@ def test_capable_connector_uses_divergent_partial_hit_lookup():
 
     result = Scheduler._get_local_prefix_cache_hit(scheduler, MagicMock())
 
-    assert result == (per_group_blocks, 6, 0, True)
+    assert result == (per_group_blocks, 6, 0, per_group_hits)
     manager.get_computed_blocks.assert_not_called()
 
 
@@ -167,10 +171,10 @@ def test_mamba_align_split_partial_tail_schedule(dcp_world_size: int):
     scheduler_block_size = block_size * dcp_world_size
     hash_block_size = 32
     mock = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=block_size),
+        mamba_block_size=block_size,
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
-        use_eagle=False,
+        use_eagle_block_drop=False,
         hash_block_size=hash_block_size,
         dcp_world_size=dcp_world_size,
         scheduler_block_size=scheduler_block_size,
@@ -215,10 +219,10 @@ def test_mamba_align_split_when_block_exceeds_scheduling_budget():
     token_budget = 8192
     prompt_length = 30000
     mock = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=block_size),
+        mamba_block_size=block_size,
         max_num_scheduled_tokens=token_budget,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
-        use_eagle=False,
+        use_eagle_block_drop=False,
         hash_block_size=32,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
@@ -252,12 +256,12 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
     long_prefill_threshold = 384
     prompt_length = 1300
     mock = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=block_size),
+        mamba_block_size=block_size,
         max_num_scheduled_tokens=token_budget,
         scheduler_config=SimpleNamespace(
             long_prefill_token_threshold=long_prefill_threshold
         ),
-        use_eagle=False,
+        use_eagle_block_drop=False,
         hash_block_size=32,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
@@ -2046,3 +2050,592 @@ def test_boundary_states_offered_past_prompt_for_resumed_prefill():
     offered = [b for _, _, b in drain_boundary_state_offloads(manager).get("0", [])]
     assert 2 * block_size in offered
     assert req0.num_prompt_tokens < 2 * block_size
+
+
+def _decode_tail_manager(
+    *, decode_tail: bool, num_blocks: int = 64, evict_superseded_first: bool = False
+):
+    """Full attention + one mamba "align" group, both 8-token blocks, hash
+    unit 2: several decode boundaries inside each block."""
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=8, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=8,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+        prefix_cache_decode_tail=decode_tail,
+        prefix_cache_evict_superseded_first=evict_superseded_first,
+    )
+    return make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=2,
+    )
+
+
+def _run_step(manager):
+    """The step's queued copies, their endpoints released once it has run,
+    as the scheduler releases them."""
+    copies, retained = manager.take_kv_cache_block_copies()
+    manager.block_pool.free_blocks(retained)
+    return copies
+
+
+def _prefill_and_decode(manager, req, reply, on_step=None):
+    """Prefill ``req`` in one step, then decode ``reply`` one token a step as
+    the scheduler does: schedule at the computed count, run (the queued copies
+    with it), then count the token computed and append the one sampled."""
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
+    num_new = req.num_tokens - num_computed
+    assert manager.allocate_slots(req, num_new, num_computed, computed_blocks)
+    copies = [_run_step(manager)]
+    manager.new_step_starts()
+    req.num_computed_tokens = req.num_tokens
+    req.append_output_token_ids([reply[0]])
+    for token in reply[1:]:
+        assert manager.allocate_slots(req, 1) is not None
+        copies.append(_run_step(manager))
+        if on_step is not None:
+            on_step(req)
+        manager.new_step_starts()
+        req.num_computed_tokens += 1
+        req.append_output_token_ids([token])
+    return copies
+
+
+def test_decode_tail_resumes_a_follow_up_at_the_reply_boundary():
+    """The next turn of a conversation (prompt + reply + new) resumes at the
+    last hash boundary the reply's decode passed, not at the prompt's end."""
+    manager = _decode_tail_manager(decode_tail=True)
+    prompt = [1, 2, 3, 4, 5]
+    reply = [10, 11, 12, 13, 14, 15, 16, 17, 18]  # computed through token 13
+    req0 = make_request("0", prompt, 2, sha256)
+    copies = _prefill_and_decode(manager, req0, reply)
+    assert req0.num_computed_tokens == 13
+    # A snapshot copy at each boundary inside a block the decode passed from
+    # a computed count past the prompt: 6, 10, 12 (8 is a block boundary).
+    mamba_snapshots = [c for step in copies for c in step]
+    assert len(mamba_snapshots) == 3
+    manager.free(req0)
+
+    req1 = make_request("1", prompt + reply + [20, 21, 22], 2, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req1)
+    assert num_computed == 12
+    # The mamba hit is the last snapshot taken, the copy target at 12.
+    assert computed_blocks.get_block_ids()[1][-1] == mamba_snapshots[-1].dst_block_id
+
+
+def test_decode_tail_off_resumes_at_the_block_boundary():
+    manager = _decode_tail_manager(decode_tail=False)
+    prompt = [1, 2, 3, 4, 5]
+    reply = [10, 11, 12, 13, 14, 15, 16, 17, 18]
+    req0 = make_request("0", prompt, 2, sha256)
+    copies = _prefill_and_decode(manager, req0, reply)
+    assert not [c for step in copies for c in step]
+    manager.free(req0)
+
+    req1 = make_request("1", prompt + reply + [20, 21, 22], 2, sha256)
+    _, num_computed, _ = manager.get_computed_blocks(req1)
+    assert num_computed == 8
+
+
+def test_decode_tail_keeps_one_entry_and_retires_the_rest_to_the_front():
+    """Each boundary's snapshot replaces the previous one: the superseded
+    block leaves the prefix cache and is the next block handed out, so the
+    snapshots evict no one's cache."""
+    manager = _decode_tail_manager(decode_tail=True)
+    pool = manager.block_pool
+    prompt = [1, 2, 3, 4, 5]
+    req0 = make_request("0", prompt, 2, sha256)
+    seen: list[int] = []
+
+    def on_step(req):
+        tails = manager.coordinator.single_type_managers[1]._decode_tails
+        if req.request_id in tails:
+            block, _ = tails[req.request_id]
+            if not seen or seen[-1] != block.block_id:
+                seen.append(block.block_id)
+
+    _prefill_and_decode(manager, req0, [10, 11, 12, 13, 14, 15, 16], on_step)
+    assert len(seen) == 2  # boundaries 6 and 10
+    first, latest = (pool.blocks[i] for i in seen)
+    assert first.block_hash is None
+    assert first.ref_cnt == 0
+    head = pool.free_block_queue.fake_free_list_head.next_free_block
+    assert head is first
+    assert latest.block_hash is not None
+
+
+def test_decode_tail_snapshot_is_not_taken_on_a_hit_step():
+    """A request resuming on a partial hit copies the hit state into its own
+    block with this step's copies; a snapshot of that block in the same batch
+    would read it before it is written, so none is taken then."""
+    manager = _decode_tail_manager(decode_tail=True)
+    prompt = [1, 2, 3, 4, 5]
+    reply = [10, 11, 12, 13, 14, 15, 16, 17, 18]
+    req0 = make_request("0", prompt, 2, sha256)
+    _prefill_and_decode(manager, req0, reply)
+    manager.free(req0)
+
+    req1 = make_request("1", prompt + reply + [20, 21, 22], 2, sha256)
+    req1.num_prompt_tokens = 5  # a resumed request: its prompt is the first 5
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req1)
+    assert num_computed == 12
+    assert manager.allocate_slots(req1, 1, num_computed, computed_blocks)
+    copies, _ = manager.take_kv_cache_block_copies()
+    targets = {c.dst_block_id for c in copies}
+    sources = {c.src_block_id for c in copies}
+    assert not targets & sources
+
+
+def _queue_order(manager):
+    """Block ids from the eviction end of the free queue to its tail."""
+    return [
+        b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
+    ]
+
+
+def _continue(manager, req, tokens):
+    """Decode ``tokens`` one a step (the step's copies run and are released)."""
+    for token in tokens:
+        assert manager.allocate_slots(req, 1) is not None
+        _run_step(manager)
+        manager.new_step_starts()
+        req.num_computed_tokens += 1
+        req.append_output_token_ids([token])
+
+
+def _first_step(manager, req, block_size=8):
+    """Look ``req`` up and prefill the rest, in chunks ending on block
+    boundaries as the align-mode split cuts them (a state exists only where a
+    step ends)."""
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
+    start = num_computed
+    while start < req.num_tokens:
+        end = min((start // block_size + 1) * block_size, req.num_tokens)
+        if start == num_computed:
+            assert manager.allocate_slots(
+                req, end - start, num_computed, computed_blocks
+            )
+        else:
+            assert manager.allocate_slots(req, end - start)
+        _run_step(manager)
+        manager.new_step_starts()
+        req.num_computed_tokens = start = end
+    return computed_blocks, num_computed
+
+
+def _mamba_block_at(manager, req, boundary):
+    """The mamba block cached for ``req``'s prefix of ``boundary`` tokens."""
+    cached = manager.block_pool.get_cached_block(
+        req.block_hashes[boundary // 2 - 1], [1]
+    )
+    return cached[0] if cached else None
+
+
+def _resumed_conversation(manager):
+    """A first turn (prompt 10, reply through 25) and the start of its next
+    turn, resumed at the state at 24 with a prompt of 28: the request after
+    its prefill, and the block it resumed from."""
+    req0 = make_request("0", list(range(100, 110)), 2, sha256)
+    _first_step(manager, req0)
+    req0.append_output_token_ids([200])
+    _continue(manager, req0, list(range(201, 216)))  # computed through 25
+    manager.free(req0)
+    req1 = make_request("1", [*req0.all_token_ids, 300, 301], 2, sha256)
+    computed_blocks, num_computed = _first_step(manager, req1)
+    assert num_computed == 24
+    return req1, computed_blocks.blocks[1][-1]
+
+
+@pytest.mark.parametrize("evict_superseded_first", [False, True])
+def test_the_state_a_conversation_resumed_from_is_superseded_by_a_later_one(
+    evict_superseded_first: bool,
+):
+    """Once the resumed request caches a later state (its prompt-end snapshot
+    here), the state it resumed from is no longer where its conversation
+    resumes: with the flag it goes to the eviction end, still cached."""
+    manager = _decode_tail_manager(
+        decode_tail=False, evict_superseded_first=evict_superseded_first
+    )
+    req1, resumed_from = _resumed_conversation(manager)
+    req1.append_output_token_ids([400])
+    _continue(manager, req1, [401])  # the prompt-end snapshot at 28 is kept
+    assert resumed_from.ref_cnt == 0
+    assert resumed_from.block_hash is not None
+    at_front = _queue_order(manager)[0] == resumed_from.block_id
+    assert at_front == evict_superseded_first
+
+
+def test_the_last_state_a_turn_cached_keeps_its_place():
+    """Where no decode tail follows (speculative decoding), a turn's last
+    cached state is its last block boundary: moving past it does not
+    supersede it, so the conversation's next turn resumes there."""
+    manager = _decode_tail_manager(decode_tail=False, evict_superseded_first=True)
+    req1, _ = _resumed_conversation(manager)
+    older = _mamba_block_at(manager, req1, 8)  # the first turn's, still cached
+    req1.append_output_token_ids([400])
+    _continue(manager, req1, list(range(401, 409)))  # through 36, past 32
+    last = _mamba_block_at(manager, req1, 32)
+    assert last is not None
+    manager.free(req1)
+    assert last.block_hash is not None
+    # Evicted after older cached content, not before it.
+    order = _queue_order(manager)
+    assert order.index(older.block_id) < order.index(last.block_id)
+    req2 = make_request("2", [*req1.all_token_ids, 500, 501], 2, sha256)
+    _, num_computed, _ = manager.get_computed_blocks(req2)
+    assert num_computed == 32
+
+
+def test_a_state_other_conversations_share_keeps_its_place():
+    """A state at the end of a prefix other running requests hold (a system
+    prompt) is not the request's to supersede: moving past it leaves it in
+    its place, so a later conversation still hits it."""
+    manager = _decode_tail_manager(decode_tail=False, evict_superseded_first=True)
+    shared = list(range(100, 116))  # two blocks' worth
+    req0 = make_request("0", [*shared, 1], 2, sha256)
+    _first_step(manager, req0)
+    manager.free(req0)
+    req1 = make_request("1", [*shared, 10, 11], 2, sha256)
+    computed_blocks, num_computed = _first_step(manager, req1)
+    assert num_computed == 16
+    shared_state = computed_blocks.blocks[1][-1]
+    # ...and another running conversation holds the same prefix.
+    req2 = make_request("2", [*shared, 20, 21, 22, 23, 24, 25, 26, 27, 28], 2, sha256)
+    _first_step(manager, req2)
+    req1.append_output_token_ids([500])
+    _continue(manager, req1, list(range(501, 512)))  # req1 caches 24
+    manager.free(req1)
+    manager.free(req2)
+    assert shared_state.block_hash is not None
+    assert _queue_order(manager)[0] != shared_state.block_id
+    req3 = make_request("3", [*shared, 30, 31], 2, sha256)
+    _, num_computed, _ = manager.get_computed_blocks(req3)
+    assert num_computed == 16
+
+
+def test_the_prompt_end_snapshot_is_superseded_by_a_later_state():
+    """A resumed request's prompt-end snapshot is superseded once its reply
+    caches a state past it; a new conversation's is not (siblings starting
+    from the same prompt may want it)."""
+    manager = _decode_tail_manager(decode_tail=False, evict_superseded_first=True)
+    req1, _ = _resumed_conversation(manager)
+    req1.append_output_token_ids([400])
+    _continue(manager, req1, [401, 402, 403])  # computed through 31
+    snapshot = _mamba_block_at(manager, req1, 28)
+    assert snapshot is not None
+    assert _queue_order(manager)[0] != snapshot.block_id
+    assert manager.allocate_slots(req1, 1) is not None  # caches the state at 32
+    assert snapshot.block_hash is not None
+    assert _queue_order(manager)[0] == snapshot.block_id
+
+    fresh = _decode_tail_manager(decode_tail=False, evict_superseded_first=True)
+    req0 = make_request("0", list(range(100, 110)), 2, sha256)
+    _first_step(fresh, req0)
+    req0.append_output_token_ids([200])
+    _continue(fresh, req0, [201])  # the prompt-end snapshot at 10 is kept
+    prompt_end = _mamba_block_at(fresh, req0, 10)
+    _continue(fresh, req0, list(range(202, 210)))  # caches 16
+    assert prompt_end.block_hash is not None
+    assert _queue_order(fresh)[0] != prompt_end.block_id
+
+
+def test_a_partial_hit_is_superseded_once_the_request_caches_a_later_state():
+    """A request resuming inside a block copies the hit state into its own
+    block; once it caches a later state, the hit waits at the eviction end."""
+    manager = _decode_tail_manager(decode_tail=False, evict_superseded_first=True)
+    req0, _ = _resumed_conversation(manager)  # its prompt-end snapshot at 28
+    req0.append_output_token_ids([400])
+    _continue(manager, req0, [401])
+    manager.free(req0)
+    req1 = make_request("9", [*req0.all_token_ids[:28], 30, 31, 32, 33], 2, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req1)
+    assert num_computed == 28
+    source = computed_blocks.blocks[1][-1]
+    assert manager.allocate_slots(req1, 4, num_computed, computed_blocks)  # to 32
+    copies = _run_step(manager)
+    assert any(c.src_block_id == source.block_id for c in copies)
+    assert source.ref_cnt == 0
+    assert source.block_hash is not None
+    assert _queue_order(manager)[0] == source.block_id
+
+
+def _recover_manager():
+    """Full attention + one mamba "align" group, 16-token blocks, hash unit 4,
+    decode tails taken by RecoverSSM's commit ("recover"). The unit is wider
+    than a verify window, as in production (64 against at most 14), so a
+    tail is keyed before the committed tokens pass the next unit."""
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=16,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+        prefix_cache_decode_tail=True,
+        decode_tail_mode="recover",
+    )
+    return make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=4,
+    )
+
+
+def _schedule_verify(manager, req, k):
+    """Schedule one verify step of the last token and ``k`` drafts, as the
+    scheduler does: allocate, then count its tokens computed and in flight.
+    Returns the step's decode-tail targets."""
+    assert manager.allocate_slots(req, 1 + k) is not None
+    targets = manager.take_decode_tail_targets()
+    _run_step(manager)
+    manager.new_step_starts()
+    req.num_computed_tokens += 1 + k
+    req.num_in_flight_tokens += 1 + k
+    return targets
+
+
+def _verify_output(req, k, accepted, tokens):
+    """The step's output: the rejected drafts taken back, the accepted ones
+    and the bonus token appended."""
+    req.num_in_flight_tokens -= 1 + k
+    req.num_computed_tokens -= k - accepted
+    req.append_output_token_ids(tokens[: accepted + 1])
+
+
+def test_recover_tail_is_targeted_then_keyed_once_committed():
+    """A verify window that may reach the next unit boundary gets a snapshot
+    block the worker's commit writes the state into; the scheduler keys it
+    only once the committed tokens have passed the boundary, with the
+    attention tail block, and a follow-up resumes there."""
+    manager = _recover_manager()
+    req = make_request("0", [1, 2, 3, 4, 5], 4, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
+    assert manager.allocate_slots(req, 5, num_computed, computed_blocks)
+    _run_step(manager)
+    manager.new_step_starts()
+    req.num_computed_tokens = 5
+    req.append_output_token_ids([100])
+
+    targets = _schedule_verify(manager, req, k=2)  # computes 5..7: may reach 8
+    assert targets == {"0": {1: (8, targets["0"][1][1])}}
+    snapshot = manager.block_pool.blocks[targets["0"][1][1]]
+    # Scheduled again before that step's output (async): nothing committed yet.
+    assert manager.take_decode_tail_targets() == {}
+    targets = _schedule_verify(manager, req, k=2)
+    assert targets == {}
+    assert snapshot.block_hash is None
+    # Both outputs: all accepted.
+    _verify_output(req, 2, 2, [101, 102, 103])
+    _verify_output(req, 2, 2, [104, 105, 106])
+    assert req.num_computed_tokens - req.num_in_flight_tokens == 11
+    targets = _schedule_verify(manager, req, k=2)
+    assert targets["0"] == {1: (0, 0)}  # keyed: the worker's target is cleared
+    cached = manager.block_pool.get_cached_block(req.block_hashes[8 // 4 - 1], [1])
+    assert cached == [snapshot]
+    manager.free(req)
+
+    req1 = make_request("1", [*req.all_token_ids[:9], 200, 201], 4, sha256)
+    _, num_computed, _ = manager.get_computed_blocks(req1)
+    assert num_computed == 8
+
+
+def test_recover_tail_not_crossed_goes_back_with_the_request():
+    """A request that finishes before its committed tokens reach the target
+    frees the snapshot block with its own blocks, unkeyed."""
+    manager = _recover_manager()
+    req = make_request("0", [1, 2, 3, 4, 5], 4, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
+    assert manager.allocate_slots(req, 5, num_computed, computed_blocks)
+    _run_step(manager)
+    manager.new_step_starts()
+    req.num_computed_tokens = 5
+    req.append_output_token_ids([100])
+    targets = _schedule_verify(manager, req, k=2)
+    snapshot = manager.block_pool.blocks[targets["0"][1][1]]
+    _verify_output(req, 2, 0, [101])  # only the bonus: committed 6, short of 8
+    manager.free(req)
+    assert snapshot.ref_cnt == 0
+    assert snapshot.block_hash is None
+
+
+def test_recover_tail_spoiled_by_a_step_without_drafts_is_not_keyed():
+    """A step scheduled without drafts while a target is outstanding runs no
+    RecoverSSM commit, so the boundary it may cross is never written: the
+    block goes back unkeyed once the committed tokens pass it."""
+    manager = _recover_manager()
+    req = make_request("0", [1, 2, 3, 4, 5], 4, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
+    assert manager.allocate_slots(req, 5, num_computed, computed_blocks)
+    _run_step(manager)
+    manager.new_step_starts()
+    req.num_computed_tokens = 5
+    req.append_output_token_ids([100])
+    targets = _schedule_verify(manager, req, k=2)
+    snapshot = manager.block_pool.blocks[targets["0"][1][1]]
+    _verify_output(req, 2, 1, [101, 102])  # committed 7, short of 8
+    assert _schedule_verify(manager, req, k=0) == {}  # crosses 8, no commit
+    _verify_output(req, 0, 0, [103])
+    targets = _schedule_verify(manager, req, k=2)
+    assert targets["0"] == {1: (0, 0)}
+    assert snapshot.block_hash is None and snapshot.ref_cnt == 0
+
+
+def test_recover_tail_not_targeted_in_a_resumed_prefill():
+    """A request resumed from preemption recomputes its outputs as prefill,
+    which runs no commit: no target until it decodes past them."""
+    manager = _recover_manager()
+    req = make_request("0", [1, 2, 3, 4, 5], 4, sha256)
+    req.append_output_token_ids([100, 101, 102, 103, 104, 105])
+    # The resumed prefill, in two chunks: 0..5, then 5..11 across 8.
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
+    assert manager.allocate_slots(req, 5, num_computed, computed_blocks)
+    _run_step(manager)
+    manager.new_step_starts()
+    req.num_computed_tokens = 5
+    assert manager.allocate_slots(req, 6) is not None
+    assert manager.take_decode_tail_targets() == {}
+    _run_step(manager)
+    manager.new_step_starts()
+    req.num_computed_tokens = 11
+    req.append_output_token_ids([106])
+    # Decoding from 11: the window 11..13 may reach 12.
+    targets = _schedule_verify(manager, req, k=2)
+    assert targets["0"][1][0] == 12
+
+
+def _context_threads_manager():
+    """One full-attention group of 4-token blocks, hash unit 4, with
+    CacheConfig.prefix_cache_context_threads on."""
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            )
+        ],
+        prefix_cache_context_threads=True,
+    )
+    return make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=4,
+    )
+
+
+def _run_in_context(manager, req_id, prompt, context, epoch):
+    """Schedule ``prompt`` as a request of ``context`` at ``epoch`` and
+    compute it whole; the request and its blocks."""
+    req = make_request(req_id, prompt, 4, sha256)
+    req.sampling_params.extra_args = {
+        "prefix_cache_context": context,
+        "prefix_cache_epoch": epoch,
+    }
+    computed, num_computed, _ = manager.get_computed_blocks(req)
+    assert manager.allocate_slots(
+        req, len(prompt) - num_computed, num_computed, computed
+    )
+    req.num_computed_tokens = len(prompt)
+    blocks = list(manager.coordinator.single_type_managers[0].req_to_blocks[req_id])
+    return req, blocks
+
+
+def _eviction_front(manager, n):
+    return [
+        b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
+    ][:n]
+
+
+def test_context_threads_send_dead_blocks_to_the_eviction_end():
+    """CacheConfig.prefix_cache_context_threads: a context's next turn leaves
+    the earlier blocks it does not hold dead, a later epoch the whole earlier
+    thread but its own hit, and a close the rest; a block another context
+    took as a hit keeps its place."""
+    manager = _context_threads_manager()
+    pool = manager.block_pool
+
+    def run(req_id, prompt, context, epoch):
+        return _run_in_context(manager, req_id, prompt, context, epoch)
+
+    def front(n):
+        return _eviction_front(manager, n)
+
+    r1, b1 = run("1", list(range(1, 13)), "g/a", 0)
+    manager.free(r1)
+    # The next turn keeps the first two blocks and diverges in the third.
+    r2, b2 = run("2", [*range(1, 9), *range(20, 28)], "g/a", 0)
+    assert b2[:2] == b1[:2]
+    # Freed as the scheduler defers a free behind a step in flight.
+    pool.free_blocks(reversed(manager.pop_blocks_for_free(r2)))
+    assert front(1) == [b1[2].block_id] and b1[2].block_hash is not None
+    # A rewritten history (epoch 1) keeping only the first block: the rest of
+    # the thread goes to the eviction end at once.
+    r3, b3 = run("3", [*range(1, 5), *range(30, 38)], "g/a", 1)
+    assert b3[0] is b1[0]
+    assert set(front(3)) == {b.block_id for b in b2[1:4]}
+    # Another context takes the first block as a hit.
+    r4, b4 = run("4", [*range(1, 5), 40, 41, 42, 43, 44], "h/b", 0)
+    assert b4[0] is b1[0] and b1[0].context_shared
+    manager.free(r4)
+    manager.free(r3)
+    assert manager.close_prefix_cache_context("g") == 2
+    assert set(front(2)) == {b.block_id for b in b3[1:3]}
+    assert b1[0].block_id not in front(8)
+
+
+def test_a_close_ends_a_thread_whose_free_is_still_held():
+    """A close that finds a request's blocks still held (a host tier copying
+    its finished thread) ends that thread at the free: its blocks go to the
+    eviction end and its keys to the host tier as closed. A request of the
+    context after the close opens a live thread again."""
+    manager = _context_threads_manager()
+    threads = manager.block_pool.context_threads
+    assert threads is not None
+
+    r1, b1 = _run_in_context(manager, "1", list(range(1, 13)), "g/a", 0)
+    assert manager.close_prefix_cache_context("g") == 0
+    manager.free(r1)
+    assert set(_eviction_front(manager, 3)) == {b.block_id for b in b1}
+    closed = threads.take_dead_keys()
+    assert [key for key, _, _ in closed] == [b.block_hash for b in b1]
+    assert {(context, cause) for _, context, cause in closed} == {("g/a", "close")}
+
+    r2, _ = _run_in_context(manager, "2", list(range(1, 17)), "g/a", 0)
+    manager.free(r2)
+    assert not threads.take_dead_keys()
+    assert manager.close_prefix_cache_context("g") > 0

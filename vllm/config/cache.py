@@ -66,7 +66,7 @@ def _get_prefix_cache_retention_interval() -> int | None:
     return 0 if env_value is None else int(env_value)
 
 
-MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
+MambaDType = Literal["auto", "float32", "float16", "bfloat16", "fp8_e4m3"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
@@ -108,6 +108,58 @@ class CacheConfig:
 
     This equals to the `hash_block_size` used throughout the KV cache code.
     """
+    prefix_cache_decode_tail: bool = False
+    """Keep, for each decoding request, a prefix-cache entry at the latest
+    `prefix_match_unit` boundary its decode has passed: a copy of every Mamba
+    "align" group's running state there, and the attention tail block under
+    the same key. A request whose prompt extends an earlier request's prompt
+    and reply (a conversation's next turn) then resumes within one unit of the
+    reply's end; without it the hit stops at the earlier prompt's end or the
+    last block boundary before it. Each request keeps one such entry, the
+    previous one released as decode passes the next boundary, at the cost of
+    one state copy per Mamba group per unit decoded. Needs fine-grained hits
+    (`prefix_match_unit` below a Mamba "align" block); under speculative
+    decoding, GDN RecoverSSM, whose commit writes the state at the boundary a
+    verify window crosses."""
+    transient_kv_pool: bool = False
+    """Give the transient cache groups, per-request rings the prefix cache never
+    keeps (Qwen4Exp QSA's open-group keys), a block pool of their own outside
+    the shared one. Every block id of the shared pool costs its widest group's
+    bytes, so a ring holding a few kilobytes otherwise takes a whole block,
+    one per running request. The pool holds four rings per `max_num_seqs` and
+    transient group (requests whose blocks a connector still holds after they
+    finish keep theirs); a request that finds it empty waits a step, as for KV
+    capacity.
+    Needs the V2 model runner."""
+    prefix_cache_evict_superseded_first: bool = False
+    """Put cached blocks their owner has superseded at the eviction end of the
+    free queue rather than its tail, so allocations evict them before any
+    live conversation's context. Free blocks are otherwise ordered by when
+    they were freed, and a conversation between turns is evicted once that
+    many blocks have been allocated after it, however much of the queue is
+    blocks nobody will ask for again. Superseded: a Mamba "align" state of a
+    request once the request caches a later one (the state it resumed from,
+    its block-boundary checkpoints, its prompt-end state, a decode tail): a
+    conversation resumes at the latest state it cached, so the request's last
+    stays in its place. The blocks stay cached until evicted. A block that
+    more than one request took as a hit (a prefix other conversations share)
+    keeps its place, and so do a state ending a prefix another running
+    request holds and the prompt-region states of a request that did not
+    resume a conversation of its own (it may share them with its siblings)."""
+    prefix_cache_context_threads: bool = False
+    """Track each client context's live thread and put its dead variants at
+    the eviction end of the free queue, still cached. A request names its
+    context and the context's history epoch in
+    `SamplingParams.extra_args` (`prefix_cache_context`,
+    `prefix_cache_epoch`); the engine keeps, per context, the cached blocks
+    its latest request held. When a later request of the context frees, the
+    earlier blocks it no longer holds (the previous decode tail and
+    prompt-end state, the states it copied from) are dead; when a request
+    with a later epoch arrives (the history was rewritten), the whole
+    earlier thread is, except what the new request took as a hit; and a
+    `close_prefix_cache_context` utility call ends a context, or every
+    context under a prefix (a game's run id), the same way. A block another
+    context took as a hit, or one in use, keeps its place."""
     gpu_memory_utilization: float = Field(default=0.92, gt=0, le=1)
     """The fraction of GPU memory to be used for the model executor, which can
     range from 0 to 1. For example, a value of 0.5 would imply 50% GPU memory
@@ -184,7 +236,10 @@ class CacheConfig:
     mamba_ssm_cache_dtype: MambaDType = "auto"
     """The data type to use for the Mamba cache (ssm state only, conv state will
     still be controlled by mamba_cache_dtype). If set to 'auto', the data type
-    for the ssm state will be determined by mamba_cache_dtype."""
+    for the ssm state will be determined by mamba_cache_dtype. 'fp8_e4m3' (the
+    Qwen GDN layers of Qwen4Exp only) stores each state row as e4m3 values with
+    a float32 scale, rounded stochastically
+    (``vllm/model_executor/layers/mamba/ops/gdn_fp8_state.py``)."""
     mamba_cache_mode: MambaCacheMode = "none"
     """The cache strategy for Mamba layers:
 
@@ -206,6 +261,9 @@ class CacheConfig:
     but this is not required."""
     use_kda_recoverssm: bool = field(default=False, init=False)
     """Whether Kimi-K3 KDA uses RecoverSSM speculative decode."""
+    use_gdn_recoverssm: bool = field(default=False, init=False)
+    """Whether GatedDeltaNet (Qwen4Exp) uses RecoverSSM speculative decode,
+    from ``speculative_config.gdn_recoverssm``."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
@@ -272,6 +330,10 @@ class CacheConfig:
             "prefix_cache_retention_interval",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
+            "prefix_cache_decode_tail",
+            "transient_kv_pool",
+            "prefix_cache_evict_superseded_first",
+            "prefix_cache_context_threads",
             "mamba_page_size_padded",
             "skip_page_size_padded",
             "user_specified_block_size",

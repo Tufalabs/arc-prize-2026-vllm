@@ -37,6 +37,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
+    is_transient_spec,
 )
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
@@ -104,6 +105,10 @@ class GroupOffloadConfig(NamedTuple):
     # of these groups is volatile and lacks a stable hash, so it must
     # be excluded from store and load scheduling.
     is_eagle_group: bool = False
+    # A group the tier passes over: one block per request of scratch state
+    # the core never prefix-caches, so nothing here hashes, stores or loads
+    # it. Kept in its position because groups are addressed by index.
+    is_transient: bool = False
 
 
 def get_sliding_window_size_in_chunks(
@@ -192,6 +197,8 @@ class SchedulerOffloadConfig(NamedTuple):
         full_attn_tokens_per_chunk: set[int] = set()
         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
             kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+            if is_transient_spec(kv_spec):
+                continue
             sw = get_sliding_window_size_in_chunks(
                 kv_spec, tokens_per_block * spec.blocks_per_chunk
             )
@@ -223,11 +230,11 @@ class SchedulerOffloadConfig(NamedTuple):
             if g.is_eagle_group
         }
 
-        use_eagle = (
+        use_eagle_block_drop = (
             vllm_config.speculative_config is not None
-            and vllm_config.speculative_config.use_eagle()
+            and vllm_config.speculative_config.use_eagle_block_drop()
         )
-        if use_eagle and not eagle_groups:
+        if use_eagle_block_drop and not eagle_groups:
             eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
 
         if eagle_groups:
@@ -242,8 +249,13 @@ class SchedulerOffloadConfig(NamedTuple):
         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
             kv_cache_group = kv_cache_config.kv_cache_groups[idx]
             kv_spec = kv_cache_group.kv_cache_spec
-            sw = get_sliding_window_size_in_chunks(
-                kv_spec, tokens_per_block * spec.blocks_per_chunk
+            is_transient = is_transient_spec(kv_spec)
+            sw = (
+                None
+                if is_transient
+                else get_sliding_window_size_in_chunks(
+                    kv_spec, tokens_per_block * spec.blocks_per_chunk
+                )
             )
             kv_group_configs_list.append(
                 GroupOffloadConfig(
@@ -251,9 +263,12 @@ class SchedulerOffloadConfig(NamedTuple):
                     tokens_per_block=tokens_per_block,
                     tokens_per_chunk=tokens_per_block * spec.blocks_per_chunk,
                     hashes_per_chunk=(
-                        (tokens_per_block * spec.blocks_per_chunk)
+                        0
+                        if is_transient
+                        else (tokens_per_block * spec.blocks_per_chunk)
                         // spec.tokens_per_hash
                     ),
+                    is_transient=is_transient,
                     sliding_window_size_in_chunks=sw,
                     alignment_chunk_count=_alignment_chunk_count(
                         tokens_per_block * spec.blocks_per_chunk, sw
@@ -267,7 +282,11 @@ class SchedulerOffloadConfig(NamedTuple):
                 )
             )
         kv_group_configs = tuple(kv_group_configs_list)
-        group_block_sizes = {config.tokens_per_block for config in kv_group_configs}
+        group_block_sizes = {
+            config.tokens_per_block
+            for config in kv_group_configs
+            if not config.is_transient
+        }
         has_partial_recurrent_group = any(
             config.requires_cow_source
             and config.tokens_per_block > spec.tokens_per_hash
@@ -357,6 +376,8 @@ class RequestOffloadState:
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            if group_config.is_transient:
+                continue
             for req_block_hash in islice(
                 self.req.block_hashes,
                 group_config.hashes_per_chunk * len(group_state.offload_keys)
@@ -414,6 +435,8 @@ class RequestOffloadState:
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            if group_config.is_transient:
+                continue
             group_state.next_stored_chunk_idx = max(
                 group_state.next_stored_chunk_idx,
                 self.storable_chunks(group_config, group_state, num_offloadable_tokens),
@@ -423,6 +446,8 @@ class RequestOffloadState:
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            if group_config.is_transient:
+                continue
             group_state.num_hit_chunks = (
                 num_cached_tokens // group_config.tokens_per_chunk
             )
@@ -504,6 +529,8 @@ class OffloadingConnectorScheduler:
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
         for group_config in self.config.kv_group_configs:
+            if group_config.is_transient:
+                continue
             if group_config.sliding_window_size_in_chunks is None:
                 full_attention_groups.append(group_config.group_idx)
             else:
@@ -523,10 +550,16 @@ class OffloadingConnectorScheduler:
         self._mamba_align_size: int | None = resolve_mamba_align_size(
             spec, kv_cache_config
         )
+        # The persistent groups' block: supports_partial_tail holds only when
+        # they agree on one, and a transient group's smaller block is no tail
+        # boundary wherever it sorts among them.
+        persistent_blocks = [
+            c.tokens_per_block
+            for c in self.config.kv_group_configs
+            if not c.is_transient
+        ]
         self._partial_tail_block_size = (
-            self.config.kv_group_configs[0].tokens_per_block
-            if self.config.supports_partial_tail
-            else 0
+            persistent_blocks[0] if self.config.supports_partial_tail else 0
         )
         self._cow_source_groups = frozenset(
             config.group_idx
@@ -667,6 +700,8 @@ class OffloadingConnectorScheduler:
         for group_config, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
         ):
+            if group_config.is_transient:
+                continue
             if group_config.sliding_window_size_in_chunks is None:
                 self.manager.touch(group_state.offload_keys, req_status.req_context)
             else:
@@ -690,6 +725,7 @@ class OffloadingConnectorScheduler:
                         req_status.partial_tail_boundary,
                     )
                     for group in self.config.kv_group_configs
+                    if not group.is_transient
                 ),
                 req_status.req_context,
             )
@@ -895,6 +931,8 @@ class OffloadingConnectorScheduler:
             boundary_missed = False
             boundary_keys = []
             for group_config in self.config.kv_group_configs:
+                if group_config.is_transient:
+                    continue
                 key = self._make_boundary_key(
                     req_status.req, group_config.group_idx, boundary
                 )
@@ -909,7 +947,8 @@ class OffloadingConnectorScheduler:
             pending |= boundary_pending
             if not boundary_missed and not boundary_pending:
                 for group_config, key in zip(
-                    self.config.kv_group_configs, boundary_keys
+                    (c for c in self.config.kv_group_configs if not c.is_transient),
+                    boundary_keys,
                 ):
                     self._events_tracker.record_partial_lookup(
                         req_status.req, group_config, boundary, key
@@ -990,6 +1029,17 @@ class OffloadingConnectorScheduler:
 
         return num_hit_tokens, bool(num_hit_tokens)
 
+    def fill_divergent_hit(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        lagging_group_ids: tuple[int, ...],
+    ) -> bool:
+        """See KVConnectorBase_V1.fill_divergent_hit. The stock offloading
+        scheduler does not fill: its stores are request-scoped and a lagging
+        group's boundary block is not something it looks up on its own."""
+        return False
+
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
@@ -1014,6 +1064,10 @@ class OffloadingConnectorScheduler:
             req_status.group_states,
             blocks.blocks,
         ):
+            if group_config.is_transient:
+                group_sizes.append(0)
+                block_indices.append(0)
+                continue
             self._current_batch_allocated_block_ids.update(
                 block.block_id for block in group_blocks if block.block_id != 0
             )
@@ -1024,18 +1078,23 @@ class OffloadingConnectorScheduler:
             num_gpu_blocks = cdiv(num_cached_tokens, tokens_per_block)
 
             assert len(group_blocks) >= num_gpu_blocks
-            num_locally_computed_gpu_blocks = num_gpu_blocks
-            # Skip null placeholder blocks (used for sliding window or mamba padding).
-            for i, block in enumerate(group_blocks[:num_gpu_blocks]):
+            # ``load_start_gpu_block_idx``: the index in ``group_blocks`` where the
+            # load region begins -- a slice bound, not a count of computed blocks.
+            # Scan from the computed boundary, not 0: sparse groups (Mamba,
+            # SWA) legitimately hold non-null unhashed blocks below it.
+            # Skip nulls (sentinel / out-of-retention padding).
+            first_fresh_gpu_block_idx = cdiv(
+                num_locally_computed_tokens, tokens_per_block
+            )
+            load_start_gpu_block_idx = num_gpu_blocks
+            for i in range(first_fresh_gpu_block_idx, num_gpu_blocks):
+                block = group_blocks[i]
                 if not block.is_null and block.block_hash is None:
-                    num_locally_computed_gpu_blocks = i
+                    load_start_gpu_block_idx = i
                     break
 
-            assert (
-                num_locally_computed_tokens
-                <= num_locally_computed_gpu_blocks * tokens_per_block
-            )
-            num_pending_gpu_blocks = num_gpu_blocks - num_locally_computed_gpu_blocks
+            assert num_locally_computed_tokens % tokens_per_block == 0
+            num_pending_gpu_blocks = num_gpu_blocks - load_start_gpu_block_idx
 
             if group_config.sliding_window_size_in_chunks is not None:
                 assert (
@@ -1048,7 +1107,7 @@ class OffloadingConnectorScheduler:
             num_chunks = cdiv(num_cached_tokens, tokens_per_chunk)
             if num_pending_gpu_blocks:
                 start_chunk_idx = (
-                    num_locally_computed_gpu_blocks // self.config.blocks_per_chunk
+                    load_start_gpu_block_idx // self.config.blocks_per_chunk
                 )
                 end_chunk_idx = num_chunks - (partial_tail_boundary is not None)
                 assert len(offload_keys) >= end_chunk_idx
@@ -1062,12 +1121,10 @@ class OffloadingConnectorScheduler:
 
             dst_block_ids.extend(
                 block.block_id
-                for block in group_blocks[
-                    num_locally_computed_gpu_blocks:num_gpu_blocks
-                ]
+                for block in group_blocks[load_start_gpu_block_idx:num_gpu_blocks]
             )
             group_sizes.append(num_pending_gpu_blocks)
-            block_indices.append(num_locally_computed_gpu_blocks)
+            block_indices.append(load_start_gpu_block_idx)
 
             # Skip prefix-hit chunks for block-level policy; for
             # request-level, next_stored_chunk_idx stays at 0 so all
@@ -1168,7 +1225,8 @@ class OffloadingConnectorScheduler:
             for group_idx, block_id, boundary in entries:
                 group_config = self.config.kv_group_configs[group_idx]
                 if (
-                    block_id == 0
+                    group_config.is_transient
+                    or block_id == 0
                     or boundary > max_boundary
                     or boundary % group_config.tokens_per_chunk != 0
                 ):
@@ -1254,23 +1312,28 @@ class OffloadingConnectorScheduler:
 
             assert boundary % self._partial_tail_block_size != 0
             block_idx = boundary // self._partial_tail_block_size
+            stored_groups = [
+                g for g in self.config.kv_group_configs if not g.is_transient
+            ]
             if any(
                 group.group_idx not in self._cow_source_groups
                 and block_idx >= len(req_status.group_states[group.group_idx].block_ids)
-                for group in self.config.kv_group_configs
+                for group in stored_groups
             ):
                 continue
             keys = [
                 self._make_boundary_key(req, group.group_idx, boundary)
-                for group in self.config.kv_group_configs
+                for group in stored_groups
             ]
-            block_ids = [
-                cow_blocks[group.group_idx]
-                if group.group_idx in self._cow_source_groups
-                else req_status.group_states[group.group_idx].block_ids[block_idx]
-                for group in self.config.kv_group_configs
-            ]
-            assert all(block_id != 0 for block_id in block_ids)
+            block_id_by_group = {
+                group.group_idx: (
+                    cow_blocks[group.group_idx]
+                    if group.group_idx in self._cow_source_groups
+                    else req_status.group_states[group.group_idx].block_ids[block_idx]
+                )
+                for group in stored_groups
+            }
+            assert all(block_id != 0 for block_id in block_id_by_group.values())
 
             store_output = self.manager.prepare_store(keys, req_status.req_context)
             if store_output is None:
@@ -1281,20 +1344,22 @@ class OffloadingConnectorScheduler:
             if not store_output.keys_to_store:
                 continue
 
-            for group_config, key in zip(self.config.kv_group_configs, keys):
+            for group_config, key in zip(stored_groups, keys):
                 if key in store_output.keys_to_store:
                     self._events_tracker.record_partial_store(
                         req, group_config, boundary, key
                     )
 
-            group_by_key = {key: idx for idx, key in enumerate(keys)}
+            group_by_key = {key: g.group_idx for g, key in zip(stored_groups, keys)}
             accepted_groups = [group_by_key[key] for key in store_output.keys_to_store]
             group_sizes = [0] * len(self.config.kv_group_configs)
             block_indices = [0] * len(self.config.kv_group_configs)
             for group_idx in accepted_groups:
                 group_sizes[group_idx] = 1
                 block_indices[group_idx] = block_idx
-            source_blocks = [block_ids[group_idx] for group_idx in accepted_groups]
+            source_blocks = [
+                block_id_by_group[group_idx] for group_idx in accepted_groups
+            ]
 
             job_id = self._generate_job_id()
             req_status.transfer_jobs.add(job_id)
@@ -1352,12 +1417,11 @@ class OffloadingConnectorScheduler:
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
+                if group_config.is_transient or group_config.requires_cow_source:
+                    continue
                 num_chunks = req_status.storable_chunks(
                     group_config, group_state, num_offloadable_tokens
                 )
-
-                if group_config.requires_cow_source:
-                    continue
 
                 start_chunk_idx = group_state.next_stored_chunk_idx
                 if num_chunks <= start_chunk_idx:
@@ -1426,6 +1490,10 @@ class OffloadingConnectorScheduler:
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
+                if group_config.is_transient:
+                    group_sizes.append(0)
+                    block_indices.append(0)
+                    continue
                 is_sliding_window = (
                     group_config.sliding_window_size_in_chunks is not None
                 )

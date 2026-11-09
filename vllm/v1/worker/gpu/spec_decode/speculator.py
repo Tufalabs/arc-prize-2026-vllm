@@ -26,6 +26,13 @@ from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.sample.states import SamplingStates
+from vllm.v1.worker.gpu.spec_decode.sparse_sampler import (
+    SparseDraftState,
+    draft_sample_compact,
+    make_sparse_draft_state,
+    sparse_sampler_requested,
+)
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
@@ -139,6 +146,22 @@ class DraftModelSpeculator(BaseSpeculator):
             self.max_num_reqs, dtype=torch.float32, device=device
         )
         self.seeds = torch.zeros(self.max_num_reqs, dtype=torch.int64, device=device)
+        # The request's own top_k and top_p on the draft distribution
+        # (speculative_config.draft_top_k_top_p): copied beside temperature, so
+        # captured draft steps read them at fixed addresses.
+        self.draft_top_k_top_p = (
+            self.speculative_config.draft_sample_method == "probabilistic"
+            and self.speculative_config.draft_top_k_top_p
+        )
+        self.sampling_states: SamplingStates | None = None
+        if self.draft_top_k_top_p:
+            self.top_k = torch.full(
+                (self.max_num_reqs,), self.vocab_size, dtype=torch.int32, device=device
+            )
+            self.top_p = torch.ones(
+                self.max_num_reqs, dtype=torch.float32, device=device
+            )
+            self._warm_top_k_top_p(device)
         self.draft_tokens = torch.zeros(
             self.max_num_reqs,
             self.num_speculative_steps,
@@ -163,6 +186,9 @@ class DraftModelSpeculator(BaseSpeculator):
                 dtype=dtype,
                 device=device,
             )
+        # XKB_SPARSE_SAMPLER: the compact draft cache, set up once the draft
+        # head (and its vocabulary) is loaded.
+        self.sparse: SparseDraftState | None = None
 
         self.supports_mm_inputs = False
 
@@ -196,6 +222,8 @@ class DraftModelSpeculator(BaseSpeculator):
         target_supports_mm = MULTIMODAL_REGISTRY.supports_multimodal_inputs(
             self.vllm_config.model_config
         )
+        if sparse_sampler_requested():
+            self._init_sparse_sampler()
         draft_supports_mm = supports_multimodal_embeddings(self.model)
         self.supports_mm_inputs = target_supports_mm and draft_supports_mm
         if target_supports_mm and not draft_supports_mm:
@@ -329,6 +357,28 @@ class DraftModelSpeculator(BaseSpeculator):
         )
         return attn_metadata
 
+    def _init_sparse_sampler(self) -> None:
+        reason = ""
+        if self.draft_top_k_top_p:
+            reason = "draft_top_k_top_p is on"
+        elif self.use_fp64_gumbel:
+            reason = "use_fp64_gumbel is on"
+        elif not hasattr(self.model, "compute_draft_vocab_logits"):
+            reason = "the draft model has no compute_draft_vocab_logits"
+        else:
+            self.sparse, reason = make_sparse_draft_state(
+                self.model.draft_vocab_targets(), self.vocab_size, self.draft_logits
+            )
+        if self.sparse is None:
+            logger.warning("XKB_SPARSE_SAMPLER stays off: %s.", reason)
+        else:
+            logger.info(
+                "XKB_SPARSE_SAMPLER: drafts sampled over %d draft-vocabulary "
+                "tokens, verified over kept-token lists of %d.",
+                self.sparse.targets.numel(),
+                self.sparse.list_size,
+            )
+
     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
         """Dtype and fill for the cached proposal distribution.
 
@@ -371,8 +421,22 @@ class DraftModelSpeculator(BaseSpeculator):
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
+        if draft_logits is not None and self.sparse is not None:
+            return draft_sample_compact(
+                self.model.compute_draft_vocab_logits(hidden_states),
+                self.sparse.targets,
+                idx_mapping,
+                temperature,
+                seeds,
+                sample_src_positions,
+                self.sparse.cache,
+                self.sparse.cache_lse,
+                draft_step,
+            )
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
+            if self.draft_top_k_top_p:
+                logits = self._mask_top_k_top_p(logits, idx_mapping, temperature)
             return gumbel_sample(
                 logits,
                 idx_mapping,
@@ -386,6 +450,54 @@ class DraftModelSpeculator(BaseSpeculator):
                 use_fp64=self.use_fp64_gumbel,
             )
         return self._greedy_sample_draft(hidden_states)
+
+    def set_sampling_states(self, sampling_states: SamplingStates) -> None:
+        """The target sampler's per-request states, which draft_top_k_top_p
+        reads top_k and top_p from each step."""
+        self.sampling_states = sampling_states
+
+    def _warm_top_k_top_p(self, device: torch.device) -> None:
+        """Size the top-k/top-p kernel's shared work buffer at its largest and
+        build its lookup tables before any CUDA graph is captured. The kernel
+        caches both per device and grows the buffer with the batch; a buffer
+        replaced after capture (by a larger batch here, or by the target
+        sampler, which shares the cache key) would leave captured draft steps
+        writing into freed memory, and the tables' host-to-device copy cannot
+        run while a graph is capturing. One call with a row per SM does both:
+        the buffer never holds more than a row per SM."""
+        from vllm.utils.platform_utils import num_compute_units
+        from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
+
+        rows = num_compute_units(device.index)
+        logits = torch.zeros(rows, self.vocab_size, dtype=torch.float32, device=device)
+        apply_top_k_top_p_triton(
+            logits,
+            torch.full((rows,), self.vocab_size, dtype=torch.int32, device=device),
+            torch.ones(rows, dtype=torch.float32, device=device),
+        )
+
+    def _mask_top_k_top_p(
+        self,
+        logits: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+    ) -> torch.Tensor:
+        """The drafter's logits with every token outside the request's top_k
+        and top_p at -inf. The cut is made on the temperature-scaled
+        distribution, as the target sampler makes it; the logits keep their
+        pre-temperature values, since the draft is drawn from them and cached
+        as them, and the rejection sampler applies the temperature itself.
+        Padded rows (idx -1) read request 0's values and are never sampled."""
+        from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
+
+        rows = idx_mapping.clamp(min=0).long()
+        temp = temperature[rows]
+        # A greedy request (temperature 0) takes the argmax, which every cut
+        # keeps; scale it by 1 rather than divide by zero.
+        scale = torch.where(temp > 0, temp, torch.ones_like(temp))
+        scaled = logits.float() / scale.unsqueeze(1)
+        cut = apply_top_k_top_p_triton(scaled, self.top_k[rows], self.top_p[rows])
+        return logits.masked_fill(cut == float("-inf"), float("-inf"))
 
     def _copy_request_inputs(
         self,
@@ -405,6 +517,14 @@ class DraftModelSpeculator(BaseSpeculator):
         # affect the output distribution after rejection sampling.
         self.temperature.copy_(temperature)
         self.seeds.copy_(seeds)
+        if self.draft_top_k_top_p:
+            # The NOTE above is the default: draft_top_k_top_p takes the
+            # request's top_k and top_p too.
+            assert self.sampling_states is not None, (
+                "draft_top_k_top_p needs the sampler's states (set_sampling_states)"
+            )
+            self.top_k.copy_(self.sampling_states.top_k.gpu)
+            self.top_p.copy_(self.sampling_states.top_p.gpu)
         self.idx_mapping[:num_reqs].copy_(idx_mapping)
         # idx_mapping for CG padded requests points to -1, which is ignored
         # during sampling to prevent writing stale values to draft logits.

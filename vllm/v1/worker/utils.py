@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheLayout,
     KVCacheSpec,
+    KVCacheTensor,
     MambaSpec,
     UniformTypeKVCacheSpecs,
     create_kv_cache_views,
@@ -384,14 +385,40 @@ def allocate_kv_cache(
 ) -> dict[str, torch.Tensor]:
     """Allocate the KV cache and view it as ``[B, H, N, C]`` per layer.
 
-    Every KVCacheTensor places its layers in the same backing allocation: layer ``l`` of
-    block ``b`` starts at ``offset + l * layer_stride + b * block_stride``. Cache
-    groups overlay each other, so tensors may address the same bytes.
+    Every KVCacheTensor of the shared pool places its layers in the same backing
+    allocation: layer ``l`` of block ``b`` starts at
+    ``offset + l * layer_stride + b * block_stride``. Cache groups overlay each
+    other, so tensors may address the same bytes. The transient pool's tensors
+    (``KVCacheTensor.num_blocks`` set) share an allocation of their own.
     """
     if not kv_cache_config.kv_cache_tensors:
         return {}
 
-    sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
+    shared = [t for t in kv_cache_config.kv_cache_tensors if t.num_blocks is None]
+    transient = [
+        t for t in kv_cache_config.kv_cache_tensors if t.num_blocks is not None
+    ]
+    kv_caches = _allocate_kv_cache_backing(
+        shared, kv_cache_config, device, layout, kernel_block_sizes
+    )
+    if transient:
+        kv_caches.update(
+            _allocate_kv_cache_backing(
+                transient, kv_cache_config, device, layout, kernel_block_sizes
+            )
+        )
+    return kv_caches
+
+
+def _allocate_kv_cache_backing(
+    tensors: list[KVCacheTensor],
+    kv_cache_config: KVCacheConfig,
+    device: torch.device,
+    layout: KVCacheLayout,
+    kernel_block_sizes: list[int] | None,
+) -> dict[str, torch.Tensor]:
+    """One backing allocation for ``tensors``, viewed per layer."""
+    sizes = {tensor.size for tensor in tensors}
     assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
     raw_size = sizes.pop()
     # wvSplitKrc's process-lifetime static workspaces (csrc/rocm/skinny_gemms.cu)
@@ -411,7 +438,7 @@ def allocate_kv_cache(
     buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
 
     kv_caches: dict[str, torch.Tensor] = {}
-    for tensor in kv_cache_config.kv_cache_tensors:
+    for tensor in tensors:
         layer_name = tensor.layers[0]
         group_id, group = next(
             (group_id, group)
@@ -422,7 +449,11 @@ def allocate_kv_cache(
         if isinstance(spec, UniformTypeKVCacheSpecs):
             spec = spec.kv_cache_specs[layer_name]
 
-        num_blocks = kv_cache_config.num_blocks
+        num_blocks = (
+            kv_cache_config.num_blocks
+            if tensor.num_blocks is None
+            else tensor.num_blocks
+        )
         kernel_block_size = None
         if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[group_id]
@@ -643,6 +674,15 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
                 layer.impl._v_scale_cache = None
 
 
+# The indexed copy gathers every source block before it scatters, so a step's
+# copies need that much free memory at once, outside the KV budget: a few GiB
+# on the B200 at 0.97, well under one on an L4. A wave of partial-hit
+# admissions (four copies each on a hybrid model) can ask for more than that.
+# Copies go in chunks of at most this many bytes, or one block where a block
+# is larger.
+_MAX_BLOCK_COPY_CHUNK_BYTES = 64 * 1024 * 1024
+
+
 def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor],
     num_blocks: int,
@@ -652,6 +692,10 @@ def copy_kv_cache_blocks_inplace(
         return
 
     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
+    # Chunks copy in order, so a block that is one copy's target and another's
+    # source would be read after it is written; the one-shot gather reads every
+    # source first, and a batch like that keeps it.
+    chunked = not np.isin(indices_np[:, 1], indices_np[:, 0]).any()
     indices: torch.Tensor | None = None
     seen: set[tuple[torch.device, int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
@@ -689,7 +733,13 @@ def copy_kv_cache_blocks_inplace(
             # Fold virtual block splitting into the shape so that dim 0 counts
             # scheduler blocks; unflatten of dim 0 is always a view.
             blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
-        blocks[dst] = blocks[src]
+        per_chunk = len(src)
+        if chunked:
+            block_bytes = blocks.stride(0) * blocks.element_size()
+            per_chunk = max(1, _MAX_BLOCK_COPY_CHUNK_BYTES // block_bytes)
+        for start in range(0, len(src), per_chunk):
+            end = start + per_chunk
+            blocks[dst[start:end]] = blocks[src[start:end]]
 
 
 def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:

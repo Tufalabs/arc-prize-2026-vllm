@@ -22,6 +22,8 @@ Typical usage inside a transformer decoder layer::
     )
 """
 
+import os
+
 import torch
 from torch import nn
 
@@ -41,7 +43,20 @@ from .ops.hc import (
     hc_combine_norm,
     hc_gate_mix,
     hc_silu,
+    hc_up_mix,
+    hc_up_mix_ok,
 )
+
+# XKB: HC down, silu, up and mix in CUDA on SM 12.0, off unless XKB_XHC=1
+from .xkb_xhc import (
+    xhc_enable,
+    xhc_mix,
+    xhc_serves,
+)
+
+# XKB_HC_FUSED=1 runs the up GEMM and the gate mix as one Triton kernel (ops/hc.py,
+# hc_up_mix); off by default.
+_XKB_HC_FUSED = os.environ.get("XKB_HC_FUSED", "0") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -52,9 +67,10 @@ class GatedResidual(nn.Module):
 
     ``combine_and_mix()`` runs the pre pipeline (grouped GemmaRMSNorm -> merged
     low-rank down+inject GEMM -> silu -> up GEMM -> sigmoid -> gated mean
-    over the HC streams). When passed a pending block output and an injection,
-    it fuses their residual combine with the RMSNorm. Final mixers use
-    ``use_combine=False`` and do not produce a new injection.
+    over the HC streams). When passed a pending block output, it fuses its
+    residual combine with the RMSNorm. A missing injection selects unit-weight
+    combine. Final mixers use ``use_combine=False`` and do not produce a new
+    injection.
 
     Weights: the norm owns the grouped GemmaRMSNorm affine; the projections
     are vLLM Linear modules (merged replicated linear for down+inject), so
@@ -74,6 +90,7 @@ class GatedResidual(nn.Module):
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.use_combine = use_combine
+        self.fused_up_mix = _XKB_HC_FUSED
 
         norm_size = (
             self.hyper_hidden_size if config.hc_per_branch_norm else config.hidden_size
@@ -123,6 +140,7 @@ class GatedResidual(nn.Module):
             prefix=maybe_prefix(prefix, "input_mix_weight_up"),
             return_bias=False,
         )
+        self.xhc = xhc_enable(self)
 
     def mix(
         self, hidden_states: torch.Tensor
@@ -134,6 +152,30 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
+        injection: torch.Tensor | None
+        if self.xhc:
+            down = (
+                self.input_mix_weight_down_block_inject
+                if self.use_combine
+                else self.input_mix_weight_down
+            )
+            down_weight = down.weight
+            up_weight = self.input_mix_weight_up.weight
+            assert isinstance(down_weight, torch.Tensor)
+            assert isinstance(up_weight, torch.Tensor)
+            if xhc_serves(xn, down_weight, up_weight):
+                block_input, injection = xhc_mix(
+                    xn,
+                    down_weight,
+                    up_weight,
+                    self.hc_count if self.use_combine else 0,
+                )
+                return (
+                    hidden_states,
+                    block_input,
+                    injection if self.use_combine else None,
+                )
+
         if self.use_combine:
             # produce injection logits for combine
             split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
@@ -144,8 +186,7 @@ class GatedResidual(nn.Module):
             injection = None
 
         lora = hc_silu(lora, self.hc_count)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        block_input = self._up_and_mix(xn, lora)
 
         return hidden_states, block_input, injection
 
@@ -153,13 +194,14 @@ class GatedResidual(nn.Module):
         self,
         hidden_states: torch.Tensor,
         prev_block_output: torch.Tensor,
-        prev_injection: torch.Tensor,
+        prev_injection: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Consume a pending combine, then prepare the next block input.
 
         ``hidden_states`` is the multi-stream state from before the pending
         block's mix. Its combine with ``block_output`` is fused with this
-        module's input RMSNorm.
+        module's input RMSNorm. A missing injection applies the block output
+        to every stream with unit weight.
         """
         hidden_states, xn = hc_combine_norm(
             hidden_states,
@@ -170,6 +212,30 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
+        injection: torch.Tensor | None
+        if self.xhc:
+            down = (
+                self.input_mix_weight_down_block_inject
+                if self.use_combine
+                else self.input_mix_weight_down
+            )
+            down_weight = down.weight
+            up_weight = self.input_mix_weight_up.weight
+            assert isinstance(down_weight, torch.Tensor)
+            assert isinstance(up_weight, torch.Tensor)
+            if xhc_serves(xn, down_weight, up_weight):
+                block_input, injection = xhc_mix(
+                    xn,
+                    down_weight,
+                    up_weight,
+                    self.hc_count if self.use_combine else 0,
+                )
+                return (
+                    hidden_states,
+                    block_input,
+                    injection if self.use_combine else None,
+                )
+
         if self.use_combine:
             # produce injection logits for combine
             split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
@@ -180,16 +246,23 @@ class GatedResidual(nn.Module):
             injection = None
 
         lora = hc_silu(lora, self.hc_count)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        block_input = self._up_and_mix(xn, lora)
 
         return hidden_states, block_input, injection
+
+    def _up_and_mix(self, xn: torch.Tensor, lora: torch.Tensor) -> torch.Tensor:
+        weight = self.input_mix_weight_up.weight
+        assert isinstance(weight, torch.Tensor)
+        if self.fused_up_mix and hc_up_mix_ok(xn, lora, weight, self.hc_count):
+            return hc_up_mix(xn, lora, weight, self.hc_count)
+        gate = self.input_mix_weight_up(lora)  # [M, D]
+        return hc_gate_mix(xn, gate, self.hc_count)
 
     def combine(
         self,
         hidden_states: torch.Tensor,
         block_output: torch.Tensor,
-        injection: torch.Tensor,
+        injection: torch.Tensor | None,
     ) -> torch.Tensor:
         return hc_combine(hidden_states, block_output, injection, self.hc_count)
 

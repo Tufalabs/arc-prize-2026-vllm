@@ -13,6 +13,10 @@ from vllm.config.cache import MambaDType
 from vllm.config.model import ModelDType
 from vllm.distributed import divide
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.ops.gdn_fp8_state import (
+    FP8_STATE_DTYPE,
+    SCALE_BYTES,
+)
 from vllm.utils.torch_utils import (
     STR_DTYPE_TO_TORCH_DTYPE,
     get_kv_cache_torch_dtype,
@@ -20,6 +24,9 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 logger = init_logger(__name__)
+
+#: ``mamba_ssm_cache_dtype`` for the GDN recurrent state in FP8 rows.
+GDN_FP8_STATE = "fp8_e4m3"
 
 ConvStateLayoutType = Literal["SD", "DS"]
 
@@ -100,6 +107,11 @@ class MambaStateDtypeCalculator:
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType,
     ) -> tuple[torch.dtype, ...]:
+        if GDN_FP8_STATE in (mamba_cache_dtype, mamba_ssm_cache_dtype):
+            raise ValueError(
+                f"mamba cache dtype {GDN_FP8_STATE!r} is the GDN recurrent state's "
+                "alone, on a model that supports it (Qwen4Exp)"
+            )
         conv_state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
         if mamba_ssm_cache_dtype == "auto":
             temporal_state_dtype = conv_state_dtype
@@ -123,7 +135,16 @@ class MambaStateDtypeCalculator:
         model_dtype: ModelDType | torch.dtype,
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType = "auto",
+        allow_fp8_state: bool = False,
     ) -> tuple[torch.dtype, torch.dtype]:
+        """``allow_fp8_state``: the caller's kernels read and write an FP8
+        recurrent state (``gdn_fp8_state``), and its shape calculation packs
+        the rows (``gated_delta_net_state_shape(fp8_state=True)``)."""
+        if mamba_ssm_cache_dtype == GDN_FP8_STATE and allow_fp8_state:
+            conv_state_dtype = cls._mamba_state_dtype(
+                model_dtype, mamba_cache_dtype, "auto"
+            )[0]
+            return (conv_state_dtype, FP8_STATE_DTYPE)
         return cls._mamba_state_dtype(
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
@@ -145,6 +166,15 @@ class MambaStateDtypeCalculator:
     ) -> tuple[torch.dtype, ...]:
         activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
         return (*base_dtypes, torch.float32, activation_dtype)
+
+    @classmethod
+    def append_gdn_recoverssm_record(
+        cls,
+        base_dtypes: tuple[torch.dtype, ...],
+    ) -> tuple[torch.dtype, ...]:
+        # Correction, normalised key and gate, all float32 as the verify
+        # computed them (ops/gdn_recoverssm.py).
+        return (*base_dtypes, torch.float32, torch.float32, torch.float32)
 
 
 class MambaStateShapeCalculator:
@@ -264,7 +294,11 @@ class MambaStateShapeCalculator:
         head_v_dim: int,
         conv_kernel_size: int,
         num_spec: int = 0,
+        fp8_state: bool = False,
     ):
+        """``fp8_state``: each state row is ``head_k_dim`` e4m3 values with a
+        float32 scale, a head its rows then their scales (``gdn_fp8_state``):
+        ``head_k_dim + 4`` bytes a row's worth."""
         conv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads
         conv_state_shape = cls._orient_conv_shape(
             divide(conv_dim, tp_world_size),
@@ -274,7 +308,7 @@ class MambaStateShapeCalculator:
         temporal_state_shape = (
             divide(num_v_heads, tp_world_size),
             head_v_dim,
-            head_k_dim,
+            head_k_dim + SCALE_BYTES if fp8_state else head_k_dim,
         )
         return conv_state_shape, temporal_state_shape
 
@@ -323,6 +357,29 @@ class MambaStateShapeCalculator:
             *base_shapes,
             (local_num_heads, spec_query_len, head_dim),
             (local_num_heads, spec_query_len, 2 * head_dim),
+        )
+
+    @classmethod
+    def append_gdn_recoverssm_record(
+        cls,
+        base_shapes: tuple[tuple[int, ...], ...],
+        tp_world_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        spec_query_len: int,
+    ) -> tuple[tuple[int, ...], ...]:
+        # Per value head and position a correction [V]; per key head and
+        # position the normalised key [K]; per value head and position the
+        # scalar gate.
+        local_k_heads = divide(num_k_heads, tp_world_size)
+        local_v_heads = divide(num_v_heads, tp_world_size)
+        return (
+            *base_shapes,
+            (local_v_heads, spec_query_len, head_v_dim),
+            (local_k_heads, spec_query_len, head_k_dim),
+            (local_v_heads, spec_query_len),
         )
 
 

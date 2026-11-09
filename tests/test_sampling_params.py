@@ -49,3 +49,40 @@ def test_diffusion_accepts_top_k_top_p():
 def test_non_diffusion_models_unaffected():
     params = SamplingParams(temperature=0.7, top_k=10, seed=42)
     params.verify(MockModelConfig(), None, None, None)
+
+
+# zero_recurrent_state: what construction accepts and refuses. The position is
+# what the scheduler cuts a chunk on and what the worker arms, so a wrong one
+# blanks somewhere else and an unreachable one blanks nowhere without saying so.
+
+
+def test_zero_recurrent_takes_an_absolute_position():
+    params = SamplingParams(zero_recurrent_state=True, zero_recurrent_at=1568)
+    assert params.zero_recurrent_at == 1568
+
+
+def test_zero_recurrent_position_without_the_switch_is_rejected():
+    """A position with the feature off would blank nothing; refusing beats
+    accepting a request whose stated intent cannot happen."""
+    with pytest.raises(ValueError, match="zero_recurrent_state is False"):
+        SamplingParams(zero_recurrent_at=1568)
+
+
+def test_zero_recurrent_switch_without_a_position_is_rejected():
+    """There is no default position: it decides which state the model keeps,
+    and a silently-chosen one is a different perturbation."""
+    with pytest.raises(ValueError, match="without zero_recurrent_at"):
+        SamplingParams(zero_recurrent_state=True)
+
+
+def test_zero_recurrent_negative_position_is_rejected():
+    with pytest.raises(ValueError, match="non-negative"):
+        SamplingParams(zero_recurrent_state=True, zero_recurrent_at=-1)
+
+
+def test_zero_recurrent_position_is_not_checked_against_the_prompt_here():
+    """Construction cannot see the prompt, so the range check lives where the
+    tokenized length is known (`InputProcessor.process_inputs`, which rejects
+    a position the prompt does not reach). This pins the split, so a reader
+    does not look for the check on the wrong side of it."""
+    SamplingParams(zero_recurrent_state=True, zero_recurrent_at=4000)

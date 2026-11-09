@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NVIDIA HyperConnection kernels for Qwen4Exp."""
 
+import os
+
 import torch
 
+from vllm import envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -185,6 +188,145 @@ def _hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Te
     return out
 
 
+# Fused up GEMM + gate mix (XKB_HC_FUSED=1 in hyperconnection.py): one kernel in place
+# of the [M, R] x [R, 4 * HC_DIM] GEMM and _hc_gate_mix_kernel.
+# Tile config BM,BN,BK,warps,stages; the default is a tile sweep's best line
+# (run/kstudy/out/log_hc_fused_up_264.txt).
+_XKB_HC_UP_MIX_CFG = tuple(
+    int(v) for v in os.environ.get("XKB_HC_UP_MIX_CFG", "64,32,32,4,3").split(",")
+)
+
+
+@triton.jit
+def _hc_up_mix_kernel(
+    l_ptr,
+    w_ptr,
+    x_ptr,
+    y_ptr,
+    M,
+    stride_l,
+    stride_w,
+    stride_x,
+    stride_y,
+    R: tl.constexpr,
+    HC_DIM: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    launch_pdl: tl.constexpr,
+) -> None:
+    """y = mean over the 4 streams of sigmoid(bf16(lora @ W_up[stream].T)) * x[stream],
+    W_up stored [4 * HC_DIM, R] (HC == 4 only).
+
+    The four stream GEMMs share one K loop and one lora tile a k-step; the gate
+    rounds to bf16 as the up GEMM's output does, and the mix follows
+    _hc_gate_mix_kernel's order.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    mask_m = offs_m < M
+    l_ptrs = l_ptr + offs_m[:, None] * stride_l + offs_k[None, :]
+    w_ptrs = w_ptr + offs_k[:, None] + offs_n[None, :] * stride_w
+
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+
+    acc0 = tl.zeros([BM, BN], dtype=tl.float32)
+    acc1 = tl.zeros([BM, BN], dtype=tl.float32)
+    acc2 = tl.zeros([BM, BN], dtype=tl.float32)
+    acc3 = tl.zeros([BM, BN], dtype=tl.float32)
+    for _ in range(0, R, BK):
+        lora = tl.load(l_ptrs, mask=mask_m[:, None], other=0.0)
+        acc0 += tl.dot(lora, tl.load(w_ptrs))
+        acc1 += tl.dot(lora, tl.load(w_ptrs + HC_DIM * stride_w))
+        acc2 += tl.dot(lora, tl.load(w_ptrs + 2 * HC_DIM * stride_w))
+        acc3 += tl.dot(lora, tl.load(w_ptrs + 3 * HC_DIM * stride_w))
+        l_ptrs += BK
+        w_ptrs += BK
+
+    x_ptrs = x_ptr + offs_m[:, None] * stride_x + offs_n[None, :]
+    out = tl.zeros([BM, BN], dtype=tl.float32)
+    out += tl.sigmoid(acc0.to(tl.bfloat16).to(tl.float32)) * tl.load(
+        x_ptrs, mask=mask_m[:, None], other=0.0
+    ).to(tl.float32)
+    out += tl.sigmoid(acc1.to(tl.bfloat16).to(tl.float32)) * tl.load(
+        x_ptrs + HC_DIM, mask=mask_m[:, None], other=0.0
+    ).to(tl.float32)
+    out += tl.sigmoid(acc2.to(tl.bfloat16).to(tl.float32)) * tl.load(
+        x_ptrs + 2 * HC_DIM, mask=mask_m[:, None], other=0.0
+    ).to(tl.float32)
+    out += tl.sigmoid(acc3.to(tl.bfloat16).to(tl.float32)) * tl.load(
+        x_ptrs + 3 * HC_DIM, mask=mask_m[:, None], other=0.0
+    ).to(tl.float32)
+    out /= 4
+
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
+    tl.store(
+        y_ptr + offs_m[:, None] * stride_y + offs_n[None, :], out, mask=mask_m[:, None]
+    )
+
+
+def hc_up_mix_ok(
+    x: torch.Tensor, lora: torch.Tensor, weight: torch.Tensor, hc_count: int
+) -> bool:
+    """Whether _hc_up_mix serves these operands: 4 streams, bf16, packed row-major
+    weight, tile-aligned dims.
+    """
+    bm, bn, bk, _, _ = _XKB_HC_UP_MIX_CFG
+    return (
+        hc_count == 4
+        and not envs.VLLM_BATCH_INVARIANT
+        and x.dim() == 2
+        and lora.dim() == 2
+        and weight.dim() == 2
+        and x.dtype == torch.bfloat16
+        and lora.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.is_cuda
+        and weight.stride() == (weight.shape[1], 1)
+        and x.stride(1) == 1
+        and lora.stride(1) == 1
+        and lora.shape[0] == x.shape[0]
+        and lora.shape[1] == weight.shape[1]
+        and x.shape[1] == weight.shape[0]
+        and weight.shape[1] % bk == 0
+        and (weight.shape[0] // 4) % bn == 0
+    )
+
+
+def _hc_up_mix(
+    x: torch.Tensor, lora: torch.Tensor, weight: torch.Tensor, hc_count: int
+) -> torch.Tensor:
+    M, D = x.shape
+    HC_DIM = D // hc_count
+    bm, bn, bk, warps, stages = _XKB_HC_UP_MIX_CFG
+    out = x.new_empty(M, HC_DIM)
+    _hc_up_mix_kernel[(triton.cdiv(M, bm), HC_DIM // bn)](
+        lora,
+        weight,
+        x,
+        out,
+        M,
+        lora.stride(0),
+        weight.stride(0),
+        x.stride(0),
+        out.stride(0),
+        R=weight.shape[1],
+        HC_DIM=HC_DIM,
+        BM=bm,
+        BN=bn,
+        BK=bk,
+        num_warps=warps,
+        num_stages=stages,
+        launch_pdl=current_platform.is_arch_support_pdl(),
+    )
+    return out
+
+
 @triton.jit
 def _hc_combine_kernel(
     block_ptr,
@@ -215,14 +357,17 @@ def _hc_combine_kernel(
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
 
-    inj = tl.load(inj_ptr + row * stride_inj + offs_hc, mask_hc, other=0.0)
+    if inj_ptr is not None:
+        inj = tl.load(inj_ptr + row * stride_inj + offs_hc, mask_hc, other=0.0)
     block = tl.load(block_ptr + row * stride_block + offs_inner, mask_inner, other=0.0)
     res = tl.load(res_ptr + row * stride_res + offs, mask, other=0.0)
 
     # Keeping HC as a broadcast dimension is faster here than four separate
     # residual load/store sequences.
-    inj = 2.0 * tl.sigmoid(inj.to(tl.float32) / HC)
-    out = res.to(tl.float32) + block.to(tl.float32)[None, :] * inj[:, None]
+    if inj_ptr is not None:
+        inj = 2.0 * tl.sigmoid(inj.to(tl.float32) / HC)
+        block = block.to(tl.float32)[None, :] * inj[:, None]
+    out = res.to(tl.float32) + block.to(tl.float32)
 
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
@@ -232,17 +377,20 @@ def _hc_combine_kernel(
 def _hc_combine(
     residual: torch.Tensor,
     block_output: torch.Tensor,
-    injection_logits: torch.Tensor,
+    injection_logits: torch.Tensor | None,
     hc_count: int,
 ) -> torch.Tensor:
     N, DIM = residual.shape
     assert DIM % hc_count == 0
     hc_dim = DIM // hc_count
     assert block_output.shape == (N, hc_dim)
-    assert injection_logits.shape == (N, hc_count)
     assert residual.stride(1) == 1
     assert block_output.stride(1) == 1
-    assert injection_logits.stride(1) == 1
+    if injection_logits is not None:
+        assert injection_logits.shape == (N, hc_count)
+        assert injection_logits.stride(1) == 1
+
+    stride_injection = injection_logits.stride(0) if injection_logits is not None else 0
 
     out = residual.new_empty(residual.shape)
     BLOCK_SIZE = 512
@@ -253,7 +401,7 @@ def _hc_combine(
         out,
         block_output.stride(0),
         residual.stride(0),
-        injection_logits.stride(0),
+        stride_injection,
         out.stride(0),
         hc_dim,
         hc_count,
@@ -287,8 +435,9 @@ def _hc_combine_norm_kernel(
     NUM_TILES: tl.constexpr = triton.cdiv(HC_DIM, BLOCK_SIZE)
     NUM_TILES_PAD: tl.constexpr = triton.next_power_of_2(NUM_TILES)
 
-    row = tl.program_id(0)
-    stream = tl.program_id(1)
+    pid = tl.program_id(0)
+    row = pid // HC
+    stream = pid % HC
     offs_hc = tl.arange(0, HC_PAD)
     mask_hc = offs_hc < HC
     tile_ids = tl.arange(0, NUM_TILES_PAD)
@@ -305,27 +454,34 @@ def _hc_combine_norm_kernel(
     # Start the uncached residual load first, then issue the other combine
     # loads before consuming any of them.
     res = tl.load(res_ptr + row * stride_res + offs, mask_inner, other=0.0)
-    inj = tl.load(inj_ptr + row * stride_inj + offs_hc, mask_hc, other=0.0)
-    block = tl.load(block_ptr + row * stride_block + offs_inner, mask_inner, other=0.0)
-    inj = 2.0 * tl.sigmoid(inj.to(tl.float32) / HC)
-    inj = tl.sum(tl.where(offs_hc == stream, inj, 0.0))
+    if inj_ptr is not None:
+        inj = tl.load(inj_ptr + row * stride_inj + offs_hc, mask_hc, other=0.0)
+    block = tl.load(
+        block_ptr + row * stride_block + offs_inner,
+        mask_inner,
+        other=0.0,
+    )
+    if inj_ptr is not None:
+        inj = 2.0 * tl.sigmoid(inj.to(tl.float32) / HC)
+        block = block.to(tl.float32) * tl.sum(tl.where(offs_hc == stream, inj, 0.0))
     # Round the materialized combine result before normalization. This matches
     # the unfused combine -> RMSNorm boundary.
-    out = (res.to(tl.float32) + block.to(tl.float32) * inj).to(out_ptr.dtype.element_ty)
+    out = (res.to(tl.float32) + block.to(tl.float32)).to(out_ptr.dtype.element_ty)
+    if inj_ptr is None:
+        w = tl.load(w_ptr + w_offs, mask_inner, other=0.0)
     tl.store(out_ptr + row * stride_out + offs, out, mask=mask_inner)
 
     out = out.to(tl.float32)
-    # Keep the two-axis reduction: flattening the padded tile is ~40% slower
-    # at decode sizes.
     sum_sq = tl.sum(tl.sum(out * out, axis=1), axis=0)
     rrms = tl.rsqrt(sum_sq / HC_DIM + EPS)
 
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
 
-    # Loading the weight earlier helps decode but keeps the tile live across
-    # the reduction and regresses larger batches, so defer it to the norm.
-    w = tl.load(w_ptr + w_offs, mask_inner, other=0.0)
+    if inj_ptr is not None:
+        # Loading the weight earlier helps decode but keeps the tile live across
+        # the reduction and regresses larger batches, so defer it to the norm.
+        w = tl.load(w_ptr + w_offs, mask_inner, other=0.0)
     y = out * rrms
     y += y * w.to(tl.float32)
     tl.store(y_ptr + row * stride_y + offs, y, mask_inner)
@@ -334,7 +490,7 @@ def _hc_combine_norm_kernel(
 def _hc_combine_norm(
     residual: torch.Tensor,
     block_output: torch.Tensor,
-    injection_logits: torch.Tensor,
+    injection_logits: torch.Tensor | None,
     norm_weight: torch.Tensor,
     eps: float,
     hc_count: int,
@@ -343,17 +499,20 @@ def _hc_combine_norm(
     assert DIM % hc_count == 0
     hc_dim = DIM // hc_count
     assert block_output.shape == (N, hc_dim)
-    assert injection_logits.shape == (N, hc_count)
     assert residual.stride(1) == 1
     assert block_output.stride(1) == 1
-    assert injection_logits.stride(1) == 1
+    if injection_logits is not None:
+        assert injection_logits.shape == (N, hc_count)
+        assert injection_logits.stride(1) == 1
     assert norm_weight.is_contiguous()
     assert norm_weight.numel() in (hc_dim, DIM)
+
+    stride_injection = injection_logits.stride(0) if injection_logits is not None else 0
 
     out = residual.new_empty(residual.shape)
     y = residual.new_empty(residual.shape)
     BLOCK_SIZE = 512
-    _hc_combine_norm_kernel[(N, hc_count)](
+    _hc_combine_norm_kernel[(N * hc_count,)](
         block_output,
         residual,
         injection_logits,
@@ -362,7 +521,7 @@ def _hc_combine_norm(
         y,
         block_output.stride(0),
         residual.stride(0),
-        injection_logits.stride(0),
+        stride_injection,
         out.stride(0),
         y.stride(0),
         hc_dim,
@@ -386,10 +545,17 @@ def _hc_gate_mix_fake(
     return x.new_empty((x.shape[0], x.shape[1] // hc_count))
 
 
+def _hc_up_mix_fake(
+    x: torch.Tensor, lora: torch.Tensor, weight: torch.Tensor, hc_count: int
+) -> torch.Tensor:
+    del lora, weight
+    return x.new_empty((x.shape[0], x.shape[1] // hc_count))
+
+
 def _hc_combine_fake(
     residual: torch.Tensor,
     block_output: torch.Tensor,
-    injection_logits: torch.Tensor,
+    injection_logits: torch.Tensor | None,
     hc_count: int,
 ) -> torch.Tensor:
     del block_output, injection_logits, hc_count
@@ -399,7 +565,7 @@ def _hc_combine_fake(
 def _hc_combine_norm_fake(
     residual: torch.Tensor,
     block_output: torch.Tensor,
-    injection_logits: torch.Tensor,
+    injection_logits: torch.Tensor | None,
     norm_weight: torch.Tensor,
     eps: float,
     hc_count: int,
@@ -422,6 +588,11 @@ direct_register_custom_op(
     op_name="qwen4_exp_hc_gate_mix",
     op_func=_hc_gate_mix,
     fake_impl=_hc_gate_mix_fake,
+)
+direct_register_custom_op(
+    op_name="qwen4_exp_hc_up_mix",
+    op_func=_hc_up_mix,
+    fake_impl=_hc_up_mix_fake,
 )
 direct_register_custom_op(
     op_name="qwen4_exp_hc_combine",
@@ -449,10 +620,16 @@ def hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Ten
     return torch.ops.vllm.qwen4_exp_hc_gate_mix(x, gate, hc_count)
 
 
+def hc_up_mix(
+    x: torch.Tensor, lora: torch.Tensor, weight: torch.Tensor, hc_count: int
+) -> torch.Tensor:
+    return torch.ops.vllm.qwen4_exp_hc_up_mix(x, lora, weight, hc_count)
+
+
 def hc_combine(
     residual: torch.Tensor,
     block_output: torch.Tensor,
-    injection_logits: torch.Tensor,
+    injection_logits: torch.Tensor | None,
     hc_count: int,
 ) -> torch.Tensor:
     return torch.ops.vllm.qwen4_exp_hc_combine(
@@ -463,7 +640,7 @@ def hc_combine(
 def hc_combine_norm(
     residual: torch.Tensor,
     block_output: torch.Tensor,
-    injection_logits: torch.Tensor,
+    injection_logits: torch.Tensor | None,
     norm_weight: torch.Tensor,
     eps: float,
     hc_count: int,
@@ -484,4 +661,6 @@ __all__ = [
     "hc_combine_norm",
     "hc_gate_mix",
     "hc_silu",
+    "hc_up_mix",
+    "hc_up_mix_ok",
 ]

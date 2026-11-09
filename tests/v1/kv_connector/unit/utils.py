@@ -17,6 +17,7 @@ from vllm.config import (
     KVTransferConfig,
     ModelConfig,
     SchedulerConfig,
+    SpeculativeConfig,
     VllmConfig,
 )
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
@@ -106,6 +107,7 @@ def create_vllm_config(
     kv_connector_module_path: str | None = None,
     kv_role: str = "kv_consumer",
     disable_hybrid_kv_cache_manager: bool | None = None,
+    num_speculative_tokens: int | None = None,
 ) -> VllmConfig:
     """Initialize VllmConfig For Testing."""
     model_config = ModelConfig(
@@ -141,6 +143,11 @@ def create_vllm_config(
         kv_load_failure_policy=kv_load_failure_policy,
     )
     attention_config = AttentionConfig(backend=attention_backend)
+    speculative_config = (
+        SpeculativeConfig(model="ngram", num_speculative_tokens=num_speculative_tokens)
+        if num_speculative_tokens is not None
+        else None
+    )
     return VllmConfig(
         scheduler_config=scheduler_config,
         model_config=model_config,
@@ -148,6 +155,7 @@ def create_vllm_config(
         kv_transfer_config=kv_transfer_config,
         device_config=DeviceConfig("cpu"),
         attention_config=attention_config,
+        speculative_config=speculative_config,
     )
 
 
@@ -366,6 +374,12 @@ class MockKVConfig:
     is_async: bool = False
     num_defers_before_matching: int = 0
     supports_divergent_local_hybrid_hits: bool = False
+    # Whether to accept a divergent-hit fill (the load is never performed;
+    # tests complete it through finished_recving).
+    fill: bool = False
+    # When set, only requests whose id starts with it get `matched_tokens`;
+    # the rest look up as cold.
+    match_req_prefix: str | None = None
 
 
 class MockKVConnectorMetadata(KVConnectorMetadata):
@@ -394,10 +408,23 @@ class MockKVConnector(KVConnectorBase_V1):
             supports_divergent_local_hybrid_hits=extra_config.get(
                 "supports_divergent_local_hybrid_hits", False
             ),
+            fill=extra_config.get("fill", False),
+            match_req_prefix=extra_config.get("match_req_prefix"),
         )
         self._defers_left: defaultdict[str, int] = defaultdict(
             lambda: self.config.num_defers_before_matching
         )
+        # (request_id, num_computed_tokens, lagging_group_ids) per fill asked.
+        self.fills: list[tuple[str, int, tuple[int, ...]]] = []
+
+    def fill_divergent_hit(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        lagging_group_ids: tuple[int, ...],
+    ) -> bool:
+        self.fills.append((request.request_id, num_computed_tokens, lagging_group_ids))
+        return self.config.fill
 
     @property
     def supports_divergent_local_hybrid_hits(self) -> bool:
@@ -411,6 +438,9 @@ class MockKVConnector(KVConnectorBase_V1):
         if self._defers_left[request.request_id] > 0:
             self._defers_left[request.request_id] -= 1
             return (None, False)
+        prefix = self.config.match_req_prefix
+        if prefix is not None and not request.request_id.startswith(prefix):
+            return (0, False)
         return (self.config.matched_tokens, self.config.is_async)
 
     def update_state_after_alloc(

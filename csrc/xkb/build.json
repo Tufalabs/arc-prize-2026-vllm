@@ -1,0 +1,72 @@
+[
+  {
+    "name": "xmoe",
+    "source": "cuda/xmoe.cu",
+    "source_origin": "run/k15/xmoe/xmoe.cu",
+    "module": "vllm/model_executor/layers/fused_moe/experts/xmoe_experts.py",
+    "cubin": "cubins/xmoe.cubin",
+    "sha256": "addddc43fc81517be272f360a7594f7337c74de25d9f75f8ca02abc49c0bf476",
+    "defines": [
+      "TMAX=32",
+      "NSTAGE=3",
+      "MODE=0",
+      "DYN=1"
+    ],
+    "arch": "sm_120a"
+  },
+  {
+    "name": "xrouter",
+    "source": "cuda/xrouter.cu",
+    "source_origin": "run/k17/router/xrouter.cu",
+    "module": "vllm/models/qwen4_exp/nvidia/xkb_xrouter.py",
+    "cubin": "cubins/xrouter.cubin",
+    "sha256": "5673a1693c182cca5cedbb7f1d87a0e1fbb0b8acc114d32fc25a30f1abd2c638",
+    "defines": [
+      "MT=32",
+      "NST=3",
+      "MODE=0",
+      "PDL=1"
+    ],
+    "arch": "sm_120a"
+  },
+  {
+    "name": "xhc",
+    "source": "cuda/xhc.cu",
+    "source_origin": "run/k17/hc/xhc.cu",
+    "module": "vllm/models/qwen4_exp/nvidia/xkb_xhc.py",
+    "cubin": "cubins/xhc.cubin",
+    "sha256": "e5e709272dc17983ef635dbb0fff106f141afcfb860e1ddc8fa57494e78bd27d",
+    "defines": [
+      "MODE=0",
+      "WS=1",
+      "DPW=4",
+      "UPW=4",
+      "PDL=1"
+    ],
+    "arch": "sm_120a"
+  },
+  {
+    "name": "l2pf",
+    "source": "cuda/l2pf.cu",
+    "source_origin": "run/k16/l2pf/pf.cu",
+    "module": "vllm/models/qwen4_exp/nvidia/xkb_l2pf.py",
+    "cubin": "cubins/l2pf.cubin",
+    "sha256": "fb754e3c7a04b5742088c95a3a7c19d76f55cfca127eaa812ac2d16f488510a4",
+    "defines": [],
+    "arch": "sm_120a"
+  },
+  {
+    "name": "xgdn",
+    "source": "cuda/xgdn.cu",
+    "source_origin": "run/k16/xgdn/xgdn.cu",
+    "module": "vllm/model_executor/layers/mamba/ops/xkb_xgdn.py",
+    "cubin": "cubins/xgdn.cubin",
+    "sha256": "ef9154f0e306e5d8655be39c686acfc0e97b7a1833f7e280f3a0caa77400f414",
+    "defines": [
+      "NT=128",
+      "RPT=8",
+      "MINB=2"
+    ],
+    "arch": "sm_120a"
+  }
+]

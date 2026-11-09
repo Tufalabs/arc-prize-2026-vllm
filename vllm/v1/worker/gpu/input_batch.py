@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -84,9 +85,6 @@ class InputBatch:
     is_prefilling_np: np.ndarray
     # == np.any(is_prefilling_np)
     has_prefill: bool
-
-    # [num_reqs] only populated when pipeline parallelism is enabled.
-    max_seq_len_np: np.ndarray | None
 
     # [num_tokens_after_padding]
     input_ids: torch.Tensor
@@ -194,7 +192,6 @@ class InputBatch:
             num_computed_prefill_tokens_np=np.zeros(num_reqs, dtype=np.int32),
             is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
             has_prefill=False,
-            max_seq_len_np=None,
             input_ids=input_ids,
             positions=positions,
             is_padding=is_padding,
@@ -211,10 +208,12 @@ def set_dummy_context(
     input_batch: InputBatch,
     block_tables: "BlockTables",
     context_len: int,
-    num_kv_blocks: int,
+    num_kv_blocks: Sequence[int],
     max_model_len: int,
 ) -> None:
-    """Give each dummy request context_len of context, used when profiling step cost."""
+    """Give each dummy request context_len of context, used when profiling step cost.
+    ``num_kv_blocks``: the blocks each group's IDs can name (a group in the
+    transient pool names its own pool's)."""
     if not block_tables.input_block_tables:
         # Attention-free models have no KV context to fabricate.
         return
@@ -236,17 +235,19 @@ def set_dummy_context(
     input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
 
     seq_len = context_len + query_len
-    for block_table, block_size, bpk in zip(
+    for block_table, block_size, bpk, group_kv_blocks in zip(
         block_tables.input_block_tables,
         block_tables.kernel_block_sizes,
         block_tables.blocks_per_kv_block,
+        num_kv_blocks,
+        strict=True,
     ):
         num_blocks = min(cdiv(seq_len, block_size), block_table.shape[1])
         # Spans are disjoint until the pool runs out, then they wrap and share
         # blocks: profiling only needs the reads to be realistic, not distinct.
         block_ids = torch.arange(
             num_reqs * num_blocks, dtype=block_table.dtype, device=block_table.device
-        ) % (num_kv_blocks * bpk)
+        ) % (group_kv_blocks * bpk)
         block_table[:num_reqs, :num_blocks] = block_ids.view(num_reqs, num_blocks)
 
 

@@ -16,6 +16,20 @@ from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
 
+def _check_mm_mxfp8_shape(weight_shape: tuple[int, int]) -> tuple[bool, str | None]:
+    N, K = weight_shape
+    if K < 128:
+        return False, f"mm_mxfp8 requires K >= 128, got K={K}."
+    if K % MXFP8_BLOCK_SIZE != 0:
+        return (
+            False,
+            f"mm_mxfp8 requires K to be divisible by {MXFP8_BLOCK_SIZE}, got K={K}.",
+        )
+    if N < 128:
+        return False, f"mm_mxfp8 requires N >= 128, got N={N}."
+    return True, None
+
+
 class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
     """MXFP8 W8A8 GEMM via FlashInfer CUTLASS (SM100+)."""
 
@@ -33,6 +47,15 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
 
     @classmethod
     def can_implement(cls, c: Mxfp8LinearLayerConfig) -> tuple[bool, str | None]:
+        can_implement, reason = _check_mm_mxfp8_shape(c.weight_shape)
+        if not can_implement:
+            return False, reason
+        N, _ = c.weight_shape
+        if current_platform.is_device_capability_family(120) and N % 32 != 0:
+            return (
+                False,
+                f"mm_mxfp8 on SM12x requires N to be divisible by 32, got N={N}.",
+            )
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -61,19 +84,6 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
 
         input_shape = x.shape
         input_2d = x.view(-1, K)
-        min_dim = 128
-
-        assert min_dim <= K, (
-            f"mm_mxfp8 requires K >= {min_dim}, got K={K}. "
-            f"in_features is too small for mm_mxfp8."
-        )
-        assert K % MXFP8_BLOCK_SIZE == 0, (
-            f"mm_mxfp8 requires K to be divisible by {MXFP8_BLOCK_SIZE}, got K={K}."
-        )
-        assert min_dim <= N, (
-            f"mm_mxfp8 requires N >= {min_dim}, got N={N}. "
-            f"out_features is too small for mm_mxfp8."
-        )
 
         input_mxfp8, input_scale = mxfp8_e4m3_quantize(
             input_2d, is_sf_swizzled_layout=True
@@ -116,7 +126,7 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
 
     @classmethod
     def can_implement(cls, c: Mxfp8LinearLayerConfig) -> tuple[bool, str | None]:
-        return True, None
+        return _check_mm_mxfp8_shape(c.weight_shape)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight.data  # [N, K]
@@ -145,19 +155,6 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
 
         input_shape = x.shape
         input_2d = x.view(-1, K)
-        min_dim = 128
-
-        assert min_dim <= K, (
-            f"mm_mxfp8 requires K >= {min_dim}, got K={K}. "
-            f"in_features is too small for mm_mxfp8."
-        )
-        assert K % MXFP8_BLOCK_SIZE == 0, (
-            f"mm_mxfp8 requires K to be divisible by {MXFP8_BLOCK_SIZE}, got K={K}."
-        )
-        assert min_dim <= N, (
-            f"mm_mxfp8 requires N >= {min_dim}, got N={N}. "
-            f"out_features is too small for mm_mxfp8."
-        )
 
         input_mxfp8, input_scale = mxfp8_e4m3_quantize(
             input_2d, is_sf_swizzled_layout=True

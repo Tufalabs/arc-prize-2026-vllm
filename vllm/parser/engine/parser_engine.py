@@ -656,8 +656,16 @@ class ParserEngine(Parser):
         events = self._feed(text, token_ids)
         events.extend(self._engine.finish())
 
-        delta = self._events_to_delta(events, finished=True)
-        tool_call_info = self._build_extracted_result()
+        # The whole text in one pass: an argument delta per chunk, which a
+        # stream needs, would convert every argument so far again for each
+        # chunk -- quadratic in a long call -- and only the conversion at the
+        # call's end is kept.
+        streaming, self._stream_arg_deltas = self._stream_arg_deltas, False
+        try:
+            delta = self._events_to_delta(events, finished=True)
+            tool_call_info = self._build_extracted_result()
+        finally:
+            self._stream_arg_deltas = streaming
 
         reasoning = delta.reasoning if delta else None
         if reasoning and self._strip_trailing_reasoning_ws:

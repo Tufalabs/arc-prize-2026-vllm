@@ -21,6 +21,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     CrossAttentionSpec,
+    KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -62,6 +63,28 @@ def _reserved_block_count(
             return cdiv(num_tokens, kvcache_spec.block_size) + num_speculative_blocks
     num_tokens = min(num_tokens + num_lookahead_tokens, max_model_len)
     return cdiv(num_tokens, kvcache_spec.block_size) + num_speculative_blocks
+
+
+def _warmup_block_allocator(
+    kv_cache_config: KVCacheConfig,
+) -> Callable[[int, int], list[int]]:
+    """Hand out distinct block IDs per request and group, ``(num_blocks,
+    group_id)``, from 1 up: 0 is a pool's null block. A group in the transient
+    pool (``KVCacheGroupSpec.transient_pool``) counts in that pool's own IDs,
+    which index its own, smaller allocation."""
+    next_ids = {False: 1, True: 1}
+    groups = kv_cache_config.kv_cache_groups
+
+    def alloc(num_blocks: int, group_id: int) -> list[int]:
+        transient = groups[group_id].transient_pool
+        start = next_ids[transient]
+        next_ids[transient] = start + num_blocks
+        assert not transient or next_ids[transient] <= (
+            kv_cache_config.num_transient_blocks
+        ), "warmup needs more rings than the transient pool holds"
+        return list(range(start, start + num_blocks))
+
+    return alloc
 
 
 def _warmup_block_counter(
@@ -131,13 +154,7 @@ def run_mixed_prefill_decode_warmup(
         )
         return False
 
-    next_block_id = 1
-
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
-        block_ids = list(range(next_block_id, next_block_id + num_blocks))
-        next_block_id += num_blocks
-        return block_ids
+    _alloc_blocks = _warmup_block_allocator(model_runner.kv_cache_config)
 
     sampling_params = SamplingParams(max_tokens=2, temperature=0.0)
 
@@ -149,7 +166,9 @@ def run_mixed_prefill_decode_warmup(
             mm_features=[],
             sampling_params=sampling_params,
             pooling_params=None,
-            block_ids=tuple(_alloc_blocks(n) for n in decode_prefill_block_counts),
+            block_ids=tuple(
+                _alloc_blocks(n, g) for g, n in enumerate(decode_prefill_block_counts)
+            ),
             num_computed_tokens=0,
             lora_request=None,
             prefill_token_ids=decode_token_ids,
@@ -161,7 +180,9 @@ def run_mixed_prefill_decode_warmup(
     decode_prefill_output.total_num_scheduled_tokens = decode_prompt_len
     decode_prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
 
-    decode_new_blocks = tuple(_alloc_blocks(n) for n in decode_block_deltas)
+    decode_new_blocks = tuple(
+        _alloc_blocks(n, g) for g, n in enumerate(decode_block_deltas)
+    )
     cached_decode_req = CachedRequestData.make_empty()
     cached_decode_req.req_ids = [decode_req_id]
     cached_decode_req.num_computed_tokens = [decode_prompt_len]
@@ -179,7 +200,9 @@ def run_mixed_prefill_decode_warmup(
             mm_features=[],
             sampling_params=sampling_params,
             pooling_params=None,
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+            block_ids=tuple(
+                _alloc_blocks(n, g) for g, n in enumerate(prefill_block_counts)
+            ),
             num_computed_tokens=0,
             lora_request=None,
             prefill_token_ids=prefill_token_ids,
@@ -292,11 +315,7 @@ def warmup_kernels(
         pooling_params = None
 
     # Assign distinct block IDs per request per group. 0 null block, start from 1.
-    next_block_id = 1
-
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
-        return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
+    _alloc_blocks = _warmup_block_allocator(model_runner.kv_cache_config)
 
     # The KV-block zeroing kernel is driven by the scheduler's
     # new_block_ids_to_zero, so none of the steps below reach it.
@@ -313,7 +332,9 @@ def warmup_kernels(
                 pooling_params,
                 mm_features=warmup_mm_features,
             ),
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+            block_ids=tuple(
+                _alloc_blocks(n, g) for g, n in enumerate(prefill_block_counts)
+            ),
             prefill_token_ids=prompt_token_ids,
         )
         for i in range(num_reqs)
@@ -369,7 +390,9 @@ def warmup_kernels(
                     for spec, held in zip(kv_cache_specs, req_blocks[i])
                 ]
                 cached_req_data.new_block_ids.append(
-                    tuple(_alloc_blocks(n) for n in deltas) if any(deltas) else None
+                    tuple(_alloc_blocks(n, g) for g, n in enumerate(deltas))
+                    if any(deltas)
+                    else None
                 )
                 req_blocks[i] = [
                     held + delta for held, delta in zip(req_blocks[i], deltas)

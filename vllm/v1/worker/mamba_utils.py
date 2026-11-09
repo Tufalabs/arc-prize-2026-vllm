@@ -18,6 +18,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -366,6 +367,140 @@ def _copy_mamba_state_block(
     )
 
 
+@triton.jit
+def _zero_mamba_state_block(
+    state_idx,
+    bt_row_idx,
+    col,
+    block_table_ptrs_ptr,
+    block_table_stride_req,
+    state_base_addrs_ptr,
+    state_block_strides_ptr,
+    state_elem_sizes_ptr,
+    state_inner_sizes_ptr,
+    state_conv_widths_ptr,
+    state_group_indices_ptr,
+    state_dim_row_count_ptr,
+    state_dim_row_stride_ptr,
+    COPY_BLOCK_SIZE: tl.constexpr,
+    CONV_STATE_DIM_FIRST: tl.constexpr,
+):
+    """Zero one (layer, state-type) mamba state block.
+
+    The write side of ``SamplingParams.zero_recurrent_state``, and the device
+    equivalent of the host's ``state[block_id].zero_()``. It covers the block's
+    NATURAL extent per layout -- the bytes ``_copy_mamba_state_block`` would
+    write with ``token_bias = 0`` -- and not ``state_block_stride``, which is
+    the page stride and can exceed the data when the state tensor is
+    as_strided with page padding.
+    """
+    state_base_addr = tl.load(state_base_addrs_ptr + state_idx)
+    state_block_stride = tl.load(state_block_strides_ptr + state_idx)
+    state_elem_size = tl.load(state_elem_sizes_ptr + state_idx)
+    state_inner_size = tl.load(state_inner_sizes_ptr + state_idx)
+    conv_width = tl.load(state_conv_widths_ptr + state_idx)
+
+    group_idx = tl.load(state_group_indices_ptr + state_idx).to(tl.int64)
+    group_base_addr = tl.load(block_table_ptrs_ptr + group_idx)
+    block_table_typed = group_base_addr.to(tl.pointer_type(tl.int32))
+    block_table_base = block_table_typed + bt_row_idx * block_table_stride_req
+
+    block_id = tl.load(block_table_base + col).to(tl.int64)
+    if block_id == 0:
+        # The null block: shared, and the zero state by construction. A capped
+        # cache hit lands here, so there is nothing to write -- and writing
+        # WOULD be wrong, because at a target on the first block boundary this
+        # column is the shared system-prompt page.
+        return
+    dst_addr = state_base_addr + block_id * state_block_stride
+
+    offsets = tl.arange(0, COPY_BLOCK_SIZE)
+    zeros = tl.zeros([COPY_BLOCK_SIZE], dtype=tl.uint8)
+    is_conv_state = conv_width > 0
+
+    if CONV_STATE_DIM_FIRST and is_conv_state:
+        # DS conv layout: dim rows are strided, so the block is zeroed row by
+        # row rather than as one region.
+        dim_rows = tl.load(state_dim_row_count_ptr + state_idx)
+        row_stride = tl.load(state_dim_row_stride_ptr + state_idx)
+        per_row_bytes = conv_width.to(tl.int64) * state_elem_size
+        for d in range(0, dim_rows):
+            row_dst = dst_addr + d * row_stride
+            for i in range(0, per_row_bytes, COPY_BLOCK_SIZE):
+                mask = (i + offsets) < per_row_bytes
+                curr_dst = (row_dst + i + offsets).to(tl.pointer_type(tl.uint8))
+                tl.store(curr_dst, zeros, mask=mask)
+        return
+
+    if is_conv_state:
+        # SD conv: [conv_width, inner] contiguous within the block.
+        zero_size = conv_width.to(tl.int64) * state_inner_size * state_elem_size
+    else:
+        # Temporal: the natural block data size, as in the copy body.
+        zero_size = state_inner_size.to(tl.int64) * state_elem_size
+    for i in range(0, zero_size, COPY_BLOCK_SIZE):
+        mask = (i + offsets) < zero_size
+        curr_dst = (dst_addr + i + offsets).to(tl.pointer_type(tl.uint8))
+        tl.store(curr_dst, zeros, mask=mask)
+
+
+@triton.jit(do_not_specialize=["num_reqs"])
+def blank_mamba_state_fused_kernel(
+    blank_col_ptr,
+    block_table_ptrs_ptr,
+    block_table_stride_req: tl.int64,
+    state_base_addrs_ptr,
+    state_block_strides_ptr,
+    state_elem_sizes_ptr,
+    state_inner_sizes_ptr,
+    state_conv_widths_ptr,
+    state_group_indices_ptr,
+    state_dim_row_count_ptr,
+    state_dim_row_stride_ptr,
+    idx_mapping_ptr,
+    num_reqs,
+    COPY_BLOCK_SIZE: tl.constexpr,
+    CONV_STATE_DIM_FIRST: tl.constexpr,
+):
+    """Blank the recurrent state of every request the align preprocess fired.
+
+    Runs AFTER the pre-copy, so the blank lands on the column the align
+    machinery selected and overwrites whatever the pre-copy migrated into it.
+    Per request it fast-exits on ``blank_col < 0``, which is every request on
+    every step except the one step an armed request stands at its target -- so
+    the decision never reaches the host, and async scheduling is unaffected.
+
+    Grid: (num_reqs, num_states), the pre-copy's grid without its tile axis.
+    """
+    batch_idx = tl.program_id(0)
+    state_idx = tl.program_id(1)
+    if batch_idx >= num_reqs:
+        return
+    req_idx = tl.load(idx_mapping_ptr + batch_idx)
+    if req_idx < 0:
+        return
+    col = tl.load(blank_col_ptr + req_idx)
+    if col < 0:
+        return
+    _zero_mamba_state_block(
+        state_idx,
+        batch_idx,
+        col,
+        block_table_ptrs_ptr,
+        block_table_stride_req,
+        state_base_addrs_ptr,
+        state_block_strides_ptr,
+        state_elem_sizes_ptr,
+        state_inner_sizes_ptr,
+        state_conv_widths_ptr,
+        state_group_indices_ptr,
+        state_dim_row_count_ptr,
+        state_dim_row_stride_ptr,
+        COPY_BLOCK_SIZE,
+        CONV_STATE_DIM_FIRST,
+    )
+
+
 @triton.jit(do_not_specialize=["num_reqs"])
 def postprocess_mamba_fused_kernel(
     # Decision inputs (per-request)
@@ -511,9 +646,12 @@ def preprocess_mamba_align_fused_kernel(
     num_accepted_tokens_ptr,
     src_col_ptr,
     src_off_ptr,
+    zero_recurrent_target_ptr,
+    zero_recurrent_blank_col_ptr,
     num_reqs,
     BLOCK_SIZE: tl.constexpr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
+    HAS_ZERO_RECURRENT: tl.constexpr,
 ):
     """Fused align preprocess: emit the pre-copy src column/offset AND advance
     state_idx (with accepted-token reset) in a single launch (V2 align).
@@ -546,6 +684,34 @@ def preprocess_mamba_align_fused_kernel(
     tl.store(state_idx_ptr + req_indices, new_state_idx, mask=mask)
     should_reset = (state_idx >= 0) & (state_idx != new_state_idx)
     tl.store(num_accepted_tokens_ptr + req_indices, 1, mask=mask & should_reset)
+
+    if HAS_ZERO_RECURRENT:
+        # SamplingParams.zero_recurrent_state, decided here so it never
+        # reaches the host: `num_computed` is this step's pre-forward
+        # position, so a request "stands at" its target when the two are
+        # equal, and `new_state_idx` is the column the align machinery just
+        # selected -- the one the pre-copy is about to write into and the
+        # blank kernel is about to overwrite.
+        target = tl.load(zero_recurrent_target_ptr + req_indices, mask=mask, other=-1)
+        armed = target >= 0
+        # A target of 0 is the zero initial state already, and a request that
+        # arrived PAST its target inherits the state the cache holds there
+        # (its own, from an earlier blanked call). Both disarm without
+        # blanking; only standing exactly at a positive target fires.
+        fire = armed & (num_computed == target) & (target > 0)
+        tl.store(
+            zero_recurrent_blank_col_ptr + req_indices,
+            tl.where(fire, new_state_idx, -1),
+            mask=mask,
+        )
+        # Disarm as soon as a step at or past the target has been seen, so the
+        # blank fires exactly once. This is the device-side replacement for
+        # the host's "already done" set.
+        tl.store(
+            zero_recurrent_target_ptr + req_indices,
+            -1,
+            mask=mask & armed & (num_computed >= target),
+        )
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
@@ -707,14 +873,25 @@ def get_mamba_groups(kv_cache_config: KVCacheConfig) -> dict[MambaSpec, list[int
 def validate_mamba_state_copy_funcs(
     mamba_groups: dict[MambaSpec, list[int]],
     copy_funcs: MambaStateCopyFuncsByType,
+    cache_config: CacheConfig | None = None,
 ) -> None:
     for mamba_spec in mamba_groups:
         assert mamba_spec.mamba_type in copy_funcs, (
             f"missing state copy funcs for {mamba_spec.mamba_type}"
         )
         state_copy_funcs = copy_funcs[mamba_spec.mamba_type]
-        assert len(state_copy_funcs) == len(mamba_spec.shapes), (
-            f"{mamba_spec.mamba_type} declares {len(mamba_spec.shapes)} states, "
+        # GDN RecoverSSM appends its per-step record (correction, key, gate)
+        # after the states; the record is scratch within a step and is never
+        # copied between columns.
+        num_states = len(mamba_spec.shapes)
+        if (
+            cache_config is not None
+            and cache_config.use_gdn_recoverssm
+            and mamba_spec.mamba_type == MambaAttentionBackendEnum.GDN_ATTN
+        ):
+            num_states -= 3
+        assert len(state_copy_funcs) == num_states, (
+            f"{mamba_spec.mamba_type} declares {num_states} states, "
             f"but provides {len(state_copy_funcs)} state copy funcs"
         )
 
@@ -1230,6 +1407,48 @@ class MambaSpecDecodeGPUContext:
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=idx_mapping is not None,
             TEMPORAL_TILES=_TEMPORAL_TILES,
+        )
+
+    def run_fused_blank(
+        self,
+        num_reqs: int,
+        blank_col_gpu: torch.Tensor,
+        idx_mapping: torch.Tensor,
+    ) -> None:
+        """Zero the recurrent state block of every request whose align
+        preprocess fired this step (``SamplingParams.zero_recurrent_state``).
+
+        Launched unconditionally while any request is armed, and fast-exiting
+        per request on the device: the host never learns which requests fired,
+        which is the whole point -- reading that back would sync the pipeline
+        that async scheduling exists to keep running ahead.
+
+        Args:
+            num_reqs: Number of active requests (batch order).
+            blank_col_gpu: [max_reqs] block column to blank per req slot,
+                -1 for "not this step".
+            idx_mapping: [num_reqs] batch_idx -> req_state_idx (-1 to skip).
+        """
+        if num_reqs == 0 or not self.is_initialized:
+            return
+        total_states = self.num_states
+        grid = (num_reqs, total_states)
+        blank_mamba_state_fused_kernel[grid](
+            blank_col_gpu,
+            self.block_table_ptrs,
+            self.block_table_stride_req,
+            self.state_base_addrs,
+            self.state_block_strides,
+            self.state_elem_sizes,
+            self.state_inner_sizes,
+            self.state_conv_widths,
+            self.state_group_indices,
+            self.state_dim_row_count,
+            self.state_dim_row_stride,
+            idx_mapping,
+            num_reqs,
+            COPY_BLOCK_SIZE=1024,
+            CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
         )
 
     def run_fused_postprocess_align(

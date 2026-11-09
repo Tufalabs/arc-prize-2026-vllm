@@ -15,8 +15,11 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    FullAttentionManager,
+    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
+    transient_ring_free_list,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -134,6 +137,13 @@ class KVCacheCoordinator(ABC):
                 f" (={num_prefill_lookahead})."
             )
 
+        # One free list for every transient group: their rings overlay one
+        # allocation, so their IDs must not repeat across groups.
+        transient_free = (
+            transient_ring_free_list(self.kv_cache_config.num_transient_blocks)
+            if self.kv_cache_config.num_transient_blocks
+            else None
+        )
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
@@ -148,6 +158,9 @@ class KVCacheCoordinator(ABC):
                 pcp_world_size=pcp_world_size,
                 scheduler_block_size=self.scheduler_block_size,
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
+                transient_free=(
+                    transient_free if kv_cache_group.transient_pool else None
+                ),
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
@@ -170,6 +183,7 @@ class KVCacheCoordinator(ABC):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        read_only: bool = False,
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -192,6 +206,8 @@ class KVCacheCoordinator(ABC):
                 per-request admission cap (SWA / chunked-local). Set only by
                 the full-sequence admission gate; per-step allocation must
                 leave it False so the predictor matches `allocate_new_blocks`.
+            read_only: If True, the managers record nothing for the step the
+                count predicts, as for a reservation no allocation follows.
 
         Returns:
             The number of blocks to allocate.
@@ -209,6 +225,7 @@ class KVCacheCoordinator(ABC):
                     0,
                     num_encoder_tokens,
                     apply_admission_cap=apply_admission_cap,
+                    read_only=read_only,
                 )
             else:
                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
@@ -219,6 +236,7 @@ class KVCacheCoordinator(ABC):
                     num_local_computed_tokens,
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
+                    read_only=read_only,
                 )
         return num_blocks_to_allocate
 
@@ -228,10 +246,12 @@ class KVCacheCoordinator(ABC):
         new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        fill_group_ids: tuple[int, ...] = (),
     ) -> None:
         """
         Add the new computed blocks to the request. Optionally allocate new
-            blocks for external computed tokens (if any).
+            blocks for external computed tokens (if any), and for the groups a
+            connector fills at the boundary of a divergent hit.
 
         Args:
             request_id: The request ID.
@@ -239,6 +259,10 @@ class KVCacheCoordinator(ABC):
                 prefix cache.
             num_local_computed_tokens: The number of local computed tokens.
             num_external_computed_tokens: The number of external computed tokens.
+            fill_group_ids: Groups whose local hit fell short of
+                `num_local_computed_tokens` and whose state block at that
+                boundary the connector loads; `new_computed_blocks` is empty
+                for them.
         """
         # A running request is already tracked in num_cached_block and won't
         # have new prefix-cache hits, so this is a no-op for it.
@@ -267,6 +291,10 @@ class KVCacheCoordinator(ABC):
                     num_local_computed_tokens,
                     num_external_computed_tokens,
                 )
+        for group_id in fill_group_ids:
+            self.single_type_managers[group_id].allocate_fill_block(
+                request_id, num_local_computed_tokens
+            )
 
     def allocate_new_blocks(
         self,
@@ -660,6 +688,38 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         cache_hit_alignment_tokens = self._cache_hit_alignment_tokens
         for manager in self.single_type_managers:
             manager.cache_hit_alignment_tokens = cache_hit_alignment_tokens
+        # Decode tails (CacheConfig.prefix_cache_decode_tail) land on hash
+        # boundaries inside a block, so they need fine-grained hits; and under
+        # speculative decoding the state at a boundary a verify window crossed
+        # exists only where RecoverSSM's commit writes it
+        # (KVCacheConfig.decode_tail_mode).
+        decode_tail = kv_cache_config.prefix_cache_decode_tail and enable_caching
+        mode = kv_cache_config.decode_tail_mode
+        if decode_tail and (not self.enable_partial_hash_hits or mode is None):
+            logger.warning_once(
+                "prefix_cache_decode_tail is inactive: it needs fine-grained "
+                "prefix-cache hits (prefix_match_unit below a Mamba 'align' "
+                "block), and under speculative decoding GDN RecoverSSM."
+            )
+            decode_tail = False
+        if decode_tail:
+            for manager in self.single_type_managers:
+                manager.decode_tail_unit = hash_block_size
+                manager.decode_tail_mode = mode
+        if kv_cache_config.prefix_cache_evict_superseded_first and enable_caching:
+            # Recurrent groups ask full attention whether a prefix is shared.
+            attention = next(
+                (
+                    manager
+                    for manager in self.single_type_managers
+                    if type(manager) is FullAttentionManager
+                ),
+                None,
+            )
+            for manager in self.single_type_managers:
+                manager.evict_superseded_first = True
+                if isinstance(manager, MambaManager):
+                    manager.attention_probe = attention
         self.verify_and_split_kv_cache_groups()
 
     @property

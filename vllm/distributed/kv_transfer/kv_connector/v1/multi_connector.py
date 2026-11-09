@@ -384,6 +384,19 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     # ==============================
     # Scheduler-side methods
     # ==============================
+    def fill_divergent_hit(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        lagging_group_ids: tuple[int, ...],
+    ) -> bool:
+        # The first connector that can fill the boundary owns the load; every
+        # connector still sees update_state_after_alloc, as for any request.
+        return any(
+            c.fill_divergent_hit(request, num_computed_tokens, lagging_group_ids)
+            for c in self._connectors
+        )
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",

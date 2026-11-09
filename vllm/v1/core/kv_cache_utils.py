@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV-Cache Utilities."""
 
+import bisect
 import copy
 import hashlib
 import math
@@ -35,6 +36,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     compute_layout_strides,
+    is_transient_spec,
     iter_layer_specs,
     replace_as,
 )
@@ -182,6 +184,23 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # CacheConfig.prefix_cache_evict_superseded_first. Requests that took the
+    # block as a prefix-cache hit since it was cached: a block at most one
+    # successor used is its conversation's own, one more has taken is shared.
+    num_hits: int = 0
+    # Its owner has superseded it: the free that leaves it unreferenced puts
+    # it at the eviction end, still cached. Holds for that one free only.
+    superseded: bool = False
+    # CacheConfig.prefix_cache_context_threads: the client context whose
+    # request cached the block (request_context), and whether a request of
+    # another context has taken it as a hit since.
+    context: str | None = None
+    context_shared: bool = False
+    # Sent to the eviction end, still cached, as nobody's live context
+    # (superseded, or a dead variant of a context's thread): a host tier
+    # need not keep a copy. Cleared when a request takes it as a hit.
+    dead: bool = False
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -205,6 +224,11 @@ class KVCacheBlock:
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
         self._block_hash_num_tokens = None
+        self.num_hits = 0
+        self.superseded = False
+        self.context = None
+        self.context_shared = False
+        self.dead = False
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
@@ -697,6 +721,13 @@ def dcp_world_size_for_kv_cache_spec(spec: KVCacheSpec, dcp_world_size: int) -> 
     return 1
 
 
+def _decode_tail_mode(vllm_config: VllmConfig) -> str | None:
+    """How this engine takes decode tails (``KVCacheConfig.decode_tail_mode``)."""
+    if vllm_config.speculative_config is None:
+        return "copy"
+    return "recover" if vllm_config.cache_config.use_gdn_recoverssm else None
+
+
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -789,6 +820,23 @@ def resolve_kv_cache_block_sizes(
     return scheduler_block_size, hash_block_size
 
 
+PREFIX_CACHE_CONTEXT_ARG = "prefix_cache_context"
+PREFIX_CACHE_EPOCH_ARG = "prefix_cache_epoch"
+
+
+def request_context(request: Request) -> tuple[str, int] | None:
+    """The client context a request names in ``SamplingParams.extra_args``
+    and the context's history epoch, or None
+    (``CacheConfig.prefix_cache_context_threads``)."""
+    params = request.sampling_params
+    extra = params.extra_args if params is not None else None
+    if not extra or extra.get(PREFIX_CACHE_CONTEXT_ARG) is None:
+        return None
+    return str(extra[PREFIX_CACHE_CONTEXT_ARG]), int(
+        extra.get(PREFIX_CACHE_EPOCH_ARG, 0)
+    )
+
+
 def get_request_block_hasher(
     hash_block_size: int,
     caching_hash_fn: Callable[[Any], bytes],
@@ -812,12 +860,17 @@ def get_request_block_hasher(
             return []
 
         curr_mm_idx = 0
-        if start_token_idx > 0:
-            # Set curr_mm_idx = -1 to indicate the last mm input.
-            # Note that since we reach to this branch only when the block is
-            # completed with generated tokens, we only need to consider the
-            # last mm input.
-            curr_mm_idx = -1
+        if start_token_idx > 0 and request.mm_features:
+            # Start from the first mm input that ends past the block. A block
+            # completed with generated tokens can still hold the prompt's
+            # partial last block, and every mm input inside it belongs in its
+            # hash, or a later request with the same prompt hashes the block
+            # differently and misses it and every block after.
+            curr_mm_idx = bisect.bisect_right(
+                request.mm_features,
+                start_token_idx,
+                key=lambda f: f.mm_position.offset + f.mm_position.length,
+            )
 
         prev_block_hash_value = (
             request.block_hashes[-1] if request.block_hashes else None
@@ -1064,6 +1117,7 @@ def get_max_concurrency_for_kv_cache_config(
             group.kv_cache_spec.page_size_bytes,
         )
         for group in kv_cache_config.kv_cache_groups
+        if not group.transient_pool
     )
     max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
     return max_concurrency
@@ -1357,17 +1411,52 @@ def _get_per_layer_spec(
 
 def _get_kv_cache_bytes_per_block(
     kv_cache_groups: list[KVCacheGroupSpec],
+    transient_pool: bool = False,
 ) -> int:
-    """Return the largest cache group's bytes per block."""
+    """Return the largest cache group's bytes per block, among the groups of
+    the shared pool or, with ``transient_pool``, of the transient pool."""
     bytes_per_block = max(
         sum(
             _get_per_layer_spec(group, layer_name).page_size_bytes
             for layer_name in group.layer_names
         )
         for group in kv_cache_groups
+        if group.transient_pool == transient_pool
     )
     assert bytes_per_block > 0
     return bytes_per_block
+
+
+def _transient_pool_size(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> tuple[int, int]:
+    """Blocks in the transient pool, the null block included, and the bytes
+    of one (``CacheConfig.transient_kv_pool``); (0, 0) without one. A request
+    holds one ring in each transient group, all from the one pool; four rings
+    a ``max_num_seqs`` and group cover the running requests and those whose
+    blocks a connector still holds after they finish. The count is the
+    model's on every pipeline stage, since the scheduler hands out one set of
+    ring IDs; a stage holding none of the transient groups' layers has no
+    bytes to give a block."""
+    transient_groups = [group for group in kv_cache_groups if group.transient_pool]
+    if not transient_groups:
+        return 0, 0
+    num_blocks = 4 * vllm_config.scheduler_config.max_num_seqs * len(transient_groups)
+    local_groups = [group for group in transient_groups if group.layer_names]
+    if not local_groups:
+        return num_blocks + 1, 0
+    return num_blocks + 1, _get_kv_cache_bytes_per_block(
+        local_groups, transient_pool=True
+    )
+
+
+def _transient_pool_bytes(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> int:
+    """The transient pool's allocation, which comes out of the memory the KV
+    cache has before the shared pool is sized."""
+    num_blocks, bytes_per_block = _transient_pool_size(vllm_config, kv_cache_groups)
+    return num_blocks * bytes_per_block
 
 
 def validate_kv_cache_layout(
@@ -1430,14 +1519,28 @@ def get_kv_cache_config_from_groups(
             prefix_cache_retention_interval=(
                 vllm_config.cache_config.prefix_cache_retention_interval
             ),
+            prefix_cache_decode_tail=vllm_config.cache_config.prefix_cache_decode_tail,
+            decode_tail_mode=_decode_tail_mode(vllm_config),
+            prefix_cache_evict_superseded_first=(
+                vllm_config.cache_config.prefix_cache_evict_superseded_first
+            ),
+            prefix_cache_context_threads=(
+                vllm_config.cache_config.prefix_cache_context_threads
+            ),
         )
 
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
-    validate_kv_cache_layout(layout, kv_cache_groups)
+    shared_groups = [g for g in kv_cache_groups if not g.transient_pool]
+    transient_groups = [g for g in kv_cache_groups if g.transient_pool]
+    validate_kv_cache_layout(layout, shared_groups)
     bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
     interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
 
-    num_blocks = available_memory // bytes_per_block
+    num_transient_blocks, transient_bytes_per_block = _transient_pool_size(
+        vllm_config, kv_cache_groups
+    )
+    transient_size = num_transient_blocks * transient_bytes_per_block
+    num_blocks = max(available_memory - transient_size, 0) // bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     size = bytes_per_block * num_blocks
 
@@ -1452,13 +1555,72 @@ def get_kv_cache_config_from_groups(
     # group 0: | A [ blk 0 | blk 1 | ... ] | B [ blk 0 | blk 1 | ... ] |
     # group 1: | C [ blk 0 | blk 1 | ... ] | D [ blk 0 | blk 1 | ... ] |
 
+    kv_cache_tensors = _place_kv_cache_tensors(
+        shared_groups, num_blocks, size, layout, interleaved_block_stride
+    )
+    if transient_size:
+        # The transient pool: an allocation of its own, its blocks as wide as
+        # its widest group, placed after the shared pool's tensors. A stage
+        # holding none of its layers has nothing to place.
+        validate_kv_cache_layout(layout, transient_groups)
+        kv_cache_tensors += _place_kv_cache_tensors(
+            transient_groups,
+            num_transient_blocks,
+            transient_size,
+            layout,
+            transient_bytes_per_block if layout.is_block_outermost else None,
+            own_num_blocks=num_transient_blocks,
+        )
+        logger.info_once(
+            "Transient pool: %d blocks of %d bytes (%s GiB) for %d cache "
+            "group(s), outside the shared pool",
+            num_transient_blocks,
+            transient_bytes_per_block,
+            format_gib(transient_size),
+            len(transient_groups),
+        )
+
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=kv_cache_tensors,
+        kv_cache_groups=kv_cache_groups,
+        prefix_cache_retention_interval=(
+            vllm_config.cache_config.prefix_cache_retention_interval
+        ),
+        prefix_cache_decode_tail=vllm_config.cache_config.prefix_cache_decode_tail,
+        decode_tail_mode=_decode_tail_mode(vllm_config),
+        prefix_cache_evict_superseded_first=(
+            vllm_config.cache_config.prefix_cache_evict_superseded_first
+        ),
+        prefix_cache_context_threads=(
+            vllm_config.cache_config.prefix_cache_context_threads
+        ),
+        num_transient_blocks=num_transient_blocks,
+    )
+
+
+def _place_kv_cache_tensors(
+    kv_cache_groups: list[KVCacheGroupSpec],
+    num_blocks: int,
+    size: int,
+    layout: KVCacheLayout,
+    interleaved_block_stride: int | None,
+    own_num_blocks: int | None = None,
+) -> list[KVCacheTensor]:
+    """Place the groups' layers in one backing allocation of ``size`` bytes,
+    every group aliasing it from byte 0. ``own_num_blocks``: the allocation
+    is not the shared pool's (``KVCacheTensor.num_blocks``)."""
     kv_cache_tensors = []
     for group in kv_cache_groups:
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
-            for layer_name, spec in group_spec.kv_cache_specs.items():
-                layers_by_spec[spec].append(layer_name)
+            # The group's layer names are this worker's: a pipeline stage's
+            # projection keeps the whole-model spec for a group it holds no
+            # layer of, and a tensor for such a layer would name one this
+            # worker never allocates.
+            for layer_name in group.layer_names:
+                layers_by_spec[group_spec.kv_cache_specs[layer_name]].append(layer_name)
         elif group.layer_names:
             layers_by_spec[group_spec].extend(group.layer_names)
 
@@ -1483,18 +1645,11 @@ def get_kv_cache_config_from_groups(
                     layer_stride=layer_stride,
                     block_stride=block_stride,
                     offset=offset,
+                    num_blocks=own_num_blocks,
                 )
             )
             byte_offset += len(layer_names) * spec.page_size_bytes
-
-    return KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=kv_cache_tensors,
-        kv_cache_groups=kv_cache_groups,
-        prefix_cache_retention_interval=(
-            vllm_config.cache_config.prefix_cache_retention_interval
-        ),
-    )
+    return kv_cache_tensors
 
 
 def _promote_local_kv_cache_specs(
@@ -1841,7 +1996,7 @@ def _annotate_eagle_groups(
         use_deepseek_v4_fallback: Enable rule 2 for a DeepseekV4 packed group.
     """
     spec_config = vllm_config.speculative_config
-    if spec_config is None or not spec_config.use_eagle():
+    if spec_config is None or not spec_config.use_eagle_block_drop():
         return
 
     for group in kv_cache_groups:
@@ -1905,6 +2060,8 @@ def get_kv_cache_groups(
 ) -> list[KVCacheGroupSpec]:
     """
     Split the layers in the model into groups with the same KV cache spec.
+    With ``CacheConfig.transient_kv_pool`` the transient groups are marked to
+    take their blocks from a pool of their own.
 
     Args:
         vllm_config: The global VllmConfig
@@ -1913,6 +2070,20 @@ def get_kv_cache_groups(
     Returns:
         The generated KVCacheGroups
     """
+    groups = _group_kv_cache_layers(vllm_config, kv_cache_spec)
+    if vllm_config.cache_config.transient_kv_pool:
+        if not vllm_config.use_v2_model_runner:
+            raise ValueError("transient_kv_pool needs the V2 model runner")
+        for group in groups:
+            group.transient_pool = is_transient_spec(group.kv_cache_spec)
+    return groups
+
+
+def _group_kv_cache_layers(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    """``get_kv_cache_groups`` before any group is put in the transient pool."""
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
 
@@ -2058,6 +2229,8 @@ def _max_memory_usage_bytes_from_groups(
     bytes_per_block = _pool_bytes_per_block(kv_cache_groups)
     total_blocks = 0
     for group in kv_cache_groups:
+        if group.transient_pool:
+            continue
         spec = group.kv_cache_spec
         if isinstance(spec, UniformTypeKVCacheSpecs):
             total_blocks += spec.max_memory_usage_pages(vllm_config)
@@ -2206,6 +2379,7 @@ def _project_kv_cache_groups_to_worker(
                 worker_layer_names,
                 group_spec,
                 is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
+                transient_pool=group.transient_pool,
             )
         )
     return projected_groups
@@ -2310,14 +2484,20 @@ def get_kv_cache_configs(
                 avail_mem // bytes_per_block,
                 override,
             )
-            adjusted_memory.append(override * bytes_per_block)
+            adjusted_memory.append(
+                override * bytes_per_block + _transient_pool_bytes(vllm_config, groups)
+            )
         available_memory = adjusted_memory
 
     # Reserve the null block BlockPool permanently holds back, so auto-fit and
     # the capacity check both plan against usable blocks. Allocation below
     # still uses the full memory.
     check_memory = [
-        avail_mem - _pool_bytes_per_block(groups) if groups else avail_mem
+        avail_mem
+        - _pool_bytes_per_block(groups)
+        - _transient_pool_bytes(vllm_config, groups)
+        if groups
+        else avail_mem
         for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
     ]
 
@@ -2361,10 +2541,28 @@ def get_kv_cache_configs(
         # strides and offsets stay consistent with the shrunken allocation.
         groups = kv_cache_config.kv_cache_groups
         kv_cache_configs[i] = get_kv_cache_config_from_groups(
-            vllm_config, groups, min_num_blocks * _pool_bytes_per_block(groups)
+            vllm_config,
+            groups,
+            min_num_blocks * _pool_bytes_per_block(groups)
+            + _transient_pool_bytes(vllm_config, groups),
         )
 
     return kv_cache_configs
+
+
+def get_max_worker_kv_bytes_per_block(
+    kv_cache_configs: list[KVCacheConfig],
+) -> int | None:
+    """The most KV bytes one block takes on any worker (see
+    ``KVCacheConfig.max_worker_kv_bytes_per_block``), or None without KV."""
+    sizes = [
+        # Every KVCacheTensor describes placement within the same backing
+        # allocation, so its size is the worker's total.
+        config.kv_cache_tensors[0].size // config.num_blocks
+        for config in kv_cache_configs
+        if config.num_blocks > 0 and config.kv_cache_tensors
+    ]
+    return max(sizes) if sizes else None
 
 
 class BlockHashListWithBlockSize:

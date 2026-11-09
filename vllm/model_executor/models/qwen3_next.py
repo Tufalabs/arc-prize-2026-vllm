@@ -126,7 +126,12 @@ def _should_replicate_misaligned_shared_expert(
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
-    def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        num_experts: int | None = None,
+    ):
         super().__init__()
 
         config = vllm_config.model_config.hf_text_config
@@ -137,7 +142,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         self.ep_group = get_ep_group().device_group
         self.ep_size = self.ep_group.size()
-        self.n_routed_experts = config.num_experts
+        # A layer's own count where the caller names one (a checkpoint cut to
+        # a different number of experts per layer), else the config's.
+        self.n_routed_experts = (
+            config.num_experts if num_experts is None else num_experts
+        )
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
@@ -152,10 +161,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             parallel_config.enable_expert_parallel,
             self.is_sequence_parallel,
         )
-        if self.tp_size > config.num_experts:
+        if self.tp_size > self.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.num_experts}."
+                f"the number of experts {self.n_routed_experts}."
             )
 
         # Load balancing settings.
@@ -169,7 +178,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
-            config.num_experts,
+            self.n_routed_experts,
             bias=False,
             quant_config=None,
             prefix=f"{prefix}.gate",

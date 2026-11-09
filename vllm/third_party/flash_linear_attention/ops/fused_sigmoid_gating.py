@@ -9,6 +9,15 @@
 
 import torch
 
+from vllm.model_executor.layers.mamba.ops.gdn_fp8_state import (
+    SCALE_BYTES,
+    advance_rounding_seed,
+    check_fp8_state_layout,
+    is_fp8_state,
+    load_fp8_state_rows,
+    rounding_seed,
+    store_fp8_state_rows,
+)
 from vllm.triton_utils import tl, triton
 
 
@@ -18,6 +27,7 @@ from vllm.triton_utils import tl, triton
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
+        "STATE_FP8": lambda args: args["sr_seed"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
@@ -37,6 +47,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     cu_seqlens,
     ssm_state_indices,
     num_accepted_tokens,
+    sr_seed,
     scale,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
@@ -47,6 +58,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    KP: tl.constexpr,  # a head's bytes over V: K, or K + 4 for FP8 (gdn_fp8_state)
     stride_init_state_token: tl.constexpr,
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
@@ -58,6 +70,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     IS_KDA: tl.constexpr,
+    STATE_FP8: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -116,8 +129,15 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             p_h0 = h0 + state_idx * stride_init_state_token
         else:
             p_h0 = h0 + bos * HV * V * K
-        p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+        if STATE_FP8:
+            b_h += load_fp8_state_rows(
+                p_h0 + i_hv * V * KP, o_v, o_k, mask_v, mask_k, K, V
+            )
+        else:
+            p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+            b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+    if STATE_FP8:
+        seed = tl.load(sr_seed)
 
     for i_t in range(0, T):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
@@ -162,8 +182,26 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             # Only store if state index is valid (not NULL_BLOCK_ID=0)
             if final_state_idx > 0:
                 p_ht = ht + final_state_idx * stride_final_state_token
-                p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-                tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+                if STATE_FP8:
+                    rand_offsets = (
+                        ((final_state_idx * HV + i_hv) * V + o_v[:, None]) * K
+                        + o_k[None, :]
+                    ).to(tl.int32)
+                    store_fp8_state_rows(
+                        p_ht + i_hv * V * KP,
+                        o_v,
+                        o_k,
+                        b_h,
+                        mask_v,
+                        mask_k,
+                        seed,
+                        rand_offsets,
+                        K,
+                        V,
+                    )
+                else:
+                    p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+                    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
         else:
             p_ht = ht + (bos + i_t) * stride_final_state_token
             p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
@@ -222,6 +260,17 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         assert scale > 0, "scale must be positive"
 
+    state_fp8 = initial_state is not None and is_fp8_state(initial_state)
+    if state_fp8:
+        # FP8 rows carry their scale (gdn_fp8_state): only the in-place,
+        # indexed update a cache slot takes is supported.
+        if not inplace_final_state or ssm_state_indices is None:
+            raise ValueError(
+                "An FP8 GDN state is updated in place through ssm_state_indices"
+            )
+        check_fp8_state_layout(initial_state)
+    sr_seed = rounding_seed(q.device) if state_fp8 else None
+
     o = q.new_empty(NK, *v.shape)
     if inplace_final_state:
         final_state = initial_state
@@ -255,6 +304,7 @@ def fused_sigmoid_gating_delta_rule_update(
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
+        sr_seed=sr_seed,
         scale=scale,
         N=N,
         T=T,
@@ -265,6 +315,7 @@ def fused_sigmoid_gating_delta_rule_update(
         V=V,
         BK=BK,
         BV=BV,
+        KP=K + SCALE_BYTES if state_fp8 else K,
         stride_init_state_token=stride_init_state_token,
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
@@ -275,5 +326,7 @@ def fused_sigmoid_gating_delta_rule_update(
         num_warps=num_warps,
         num_stages=num_stages,
     )
+    if sr_seed is not None:
+        advance_rounding_seed(sr_seed)
     o = o.squeeze(0)
     return o, final_state

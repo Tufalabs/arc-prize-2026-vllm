@@ -1,0 +1,166 @@
+# Tufa fork CI: the checks a reviewer of a PR into tufa/* can run without a
+# GPU, on GitHub-hosted runners. Upstream's own CI is Buildkite plus a
+# pre-commit workflow bound to vLLM's self-hosted runners and a label gate,
+# neither of which this fork can use, so PRs here had no checks at all.
+# Upstream's pre-commit, stale-closer and nightly macOS workflows are
+# disabled in this repo's Actions settings (not deleted, so a rebase onto a
+# newer upstream carries no conflict); the label gate failed every PR.
+#
+# Scope is deliberately the fork's own delta: lint and mypy run on the files
+# changed against the base branch, the way upstream's pre-commit runs them,
+# and so less the vendored paths its top-level `exclude` names (read from
+# .pre-commit-config.yaml): upstream never lints or type-checks that code, and
+# a delta that edits a vendored file would otherwise inherit its errors. The
+# test job runs the fork's CPU-only tests. Nothing here reaches a kernel; that
+# gap is stated in each PR rather than hidden.
+name: tufa-ci
+
+on:
+  pull_request:
+    branches: ["tufa/**"]
+  push:
+    branches: ["tufa/**"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # The base for "changed files": the PR's target, or for a push the tag the
+  # release line started from (tufa/v0.29.0 is exactly v0.29.0 plus our PRs).
+  DIFF_BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'v0.29.0' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.14.0
+      - name: ruff on changed files
+        run: |
+          exclude=$(sed -n "s/^exclude: '\\(.*\\)'$/\\1/p" .pre-commit-config.yaml)
+          files=$(git diff --name-only --diff-filter=AM "$DIFF_BASE"...HEAD -- '*.py' '*.pyi' | grep -vE "^($exclude)$" || true)
+          echo "$files"
+          [ -z "$files" ] && { echo "no python changes"; exit 0; }
+          ruff check --output-format github $files
+          ruff format --check $files
+
+  mypy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The pre-commit hook's own environment, pinned the same way.
+      - run: pip install mypy==1.20.2 regex types-cachetools types-setuptools types-PyYAML types-requests types-torch pydantic
+      - name: mypy on changed files (upstream's grouping script)
+        run: |
+          exclude=$(sed -n "s/^exclude: '\\(.*\\)'$/\\1/p" .pre-commit-config.yaml)
+          files=$(git diff --name-only --diff-filter=AM "$DIFF_BASE"...HEAD -- '*.py' '*.pyi' | grep -vE "^($exclude)$" || true)
+          echo "$files"
+          [ -z "$files" ] && { echo "no python changes"; exit 0; }
+          python tools/pre_commit/mypy.py 3.12 $files
+
+  cpu-tests:
+    runs-on: ubuntu-latest
+    env:
+      # Upstream's precompiled wheel for the exact base commit, overlaid with
+      # this tree's Python: the fork carries no compiled changes, so this is
+      # the same build platypus installs. Both variables, always: without the
+      # COMMIT one the build guesses a merge-base and can land on nightly.
+      VLLM_USE_PRECOMPILED: "1"
+      VLLM_PRECOMPILED_WHEEL_COMMIT: "98dff2a81d747d1dba01a47f939f48c3526d4206"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      # uv rather than pip for the torch-sized download and the resolve; the
+      # first pip attempt was still installing after eight minutes.
+      # transformers is held to the release arc3-platypus's lock resolves.
+      # vLLM floors it and leaves the ceiling open, so an unpinned install
+      # takes the newest release on the day, and the tree's model code imports
+      # from transformers' private module paths that a release can move.
+      - name: install vllm (precompiled) and the test runner
+        run: uv pip install --system . transformers==5.16.1 pytest pytest-asyncio pytest-timeout tblib
+      # tests.tufa_cpu_platform pins vLLM to the CPU platform on this GPU-less
+      # runner, where a CUDA wheel otherwise resolves no platform at all and
+      # every VllmConfig raises; the scheduler tests are pure Python past that.
+      # It also turns pinned memory off, so the attention metadata builders
+      # that stage host tensors run here.
+      #
+      # The selection is a whitelist, kept by hand: the fork's own test files,
+      # plus upstream's CPU-runnable suites for the modules the fork's delta
+      # changes. It cannot be derived -- sampling_params and the scheduler are
+      # imported by most of tests/, nearly all of it wanting a GPU or a real
+      # model -- so a delta that reaches a new module owes a look at which of
+      # upstream's tests of it can run here. Where a file mixes those with
+      # tests that need a GPU, a gated model or the CUDA platform, the fork's
+      # own are named one by one. Deselected: the two tests below that build a
+      # real model.
+      - name: fork CPU tests
+        run: |
+          python -m pytest -q -p no:cacheprovider -p tests.tufa_cpu_platform \
+            tests/test_sampling_params.py \
+            tests/engine/test_arg_utils.py \
+            tests/test_config.py::test_breakable_cudagraph_platform_default \
+            tests/test_config.py::test_engram_tensor_parallel_size \
+            tests/test_config.py::test_engram_rejects_elastic_cross_dp \
+            tests/test_config.py::test_engram_cpu_offload_environment_fallback \
+            tests/test_config.py::test_engram_model_support \
+            tests/test_config.py::test_engram_config_defaults_to_none \
+            tests/test_config.py::test_engram_none_resolves_legacy_offload \
+            tests/test_config.py::test_engram_explicit_config_requires_supported_model \
+            tests/test_config.py::test_engram_legacy_offload_requires_supported_model \
+            tests/test_config.py::test_engram_draft_config_validates_target \
+            tests/test_config.py::test_engram_hash_tracks_storage_and_sharding \
+            tests/test_config.py::test_eagle_block_drop_can_be_disabled_without_disabling_eagle \
+            tests/models/qwen4_exp/test_config.py \
+            tests/models/qwen4_exp/test_ple.py \
+            tests/models/qwen4_exp/test_pipeline_stages.py \
+            tests/models/qwen4_exp/test_qsa_reference.py \
+            tests/models/qwen4_exp/test_pinned_embedding.py \
+            tests/models/qwen4_exp/test_gdn_fp8_state.py \
+            tests/models/qwen4_exp/test_b200_kernel_selection.py \
+            tests/models/qwen4_exp/test_ple_shared.py \
+            tests/model_executor/test_flashinfer_autotune_cache_file.py \
+            tests/tool_parsers/test_qwen3coder_tool_parser.py \
+            tests/models/kimi_k3/test_kda_metadata.py \
+            tests/kernels/quantization/test_mxfp8_kernel_selection.py \
+            tests/v1/worker/test_gpu_worker.py \
+            tests/kernels/moe/test_moe_weight_loading_padded.py \
+            tests/v1/worker/test_mamba_hybrid_state_seed.py \
+            tests/v1/worker/test_mamba_hybrid_model_state.py \
+            tests/v1/worker/test_attn_utils.py::test_block_copies_go_in_bounded_chunks \
+            tests/v1/worker/test_gpu_model_runner_v2_eplb.py \
+            tests/v1/worker/test_recoverssm_deferred_commit.py \
+            tests/v1/worker/test_gpu_local_top_k_logits.py \
+            tests/v1/attention/test_gdn_metadata_builder.py \
+            tests/utils_/test_memory_log.py \
+            tests/v1/core/test_mamba_align_chunk_split.py \
+            tests/v1/core/test_kv_cache_utils.py \
+            tests/v1/core/test_contiguous_kv_packing.py \
+            tests/v1/core/test_scheduler.py \
+            tests/v1/core/test_prefix_caching.py \
+            tests/v1/core/test_single_type_kv_cache_manager.py \
+            tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py \
+            tests/v1/core/prefix_cache/test_partial_prefix_cache_primitives.py \
+            tests/v1/kv_connector/unit/test_multi_connector.py \
+            tests/v1/kv_connector/unit/test_remote_prefill_lifecycle.py \
+            tests/v1/kv_connector/unit/offloading_connector/test_config.py \
+            tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py \
+            tests/entrypoints/openai/test_zero_recurrent_conversion.py \
+            --deselect tests/v1/kv_connector/unit/test_multi_connector.py::test_multi_example_connector_consistency \
+            --deselect tests/v1/kv_connector/unit/test_multi_connector.py::test_multi_connector_mixed_hma_disables_hybrid_kv_cache

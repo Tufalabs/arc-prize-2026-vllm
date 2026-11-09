@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import multiprocessing
 import os
 import pickle
@@ -1029,8 +1030,30 @@ class WorkerProc:
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
+        if envs.VLLM_WORKER_RPC_TRACE:
+            self._traced_busy_loop(
+                f"{envs.VLLM_WORKER_RPC_TRACE}.rank{self.rank}.jsonl"
+            )
         while True:
             self._execute_worker_rpc(self.rpc_broadcast_mq.dequeue(indefinite=True))
+
+    def _traced_busy_loop(self, path: str) -> None:
+        """The busy loop with a VLLM_WORKER_RPC_TRACE line per RPC: its method,
+        when it was dequeued and when it finished (the file appended to every
+        500)."""
+        assert self.rpc_broadcast_mq is not None
+        lines: list[str] = []
+        while True:
+            request = self.rpc_broadcast_mq.dequeue(indefinite=True)
+            dequeued = time.monotonic()
+            self._execute_worker_rpc(request)
+            method = request[0] if isinstance(request[0], str) else "<callable>"
+            finished = time.monotonic()
+            lines.append(json.dumps({"m": method, "t0": dequeued, "t1": finished}))
+            if len(lines) >= 500:
+                with open(path, "a") as f:
+                    f.write("\n".join(lines) + "\n")
+                lines.clear()
 
     def _execute_worker_rpc(
         self,

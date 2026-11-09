@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import json
 import os
 import queue
 import signal
@@ -49,6 +50,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_scheduler_kv_cache_config,
     get_kv_cache_configs,
+    get_max_worker_kv_bytes_per_block,
     get_request_block_hasher,
     init_none_hash,
     resolve_kv_cache_block_sizes,
@@ -97,6 +99,14 @@ from vllm.version import __version__ as VLLM_VERSION
 logger = init_logger(__name__)
 
 
+def _batch_size(scheduler_output: SchedulerOutput) -> list[int]:
+    """[requests, tokens] a batch schedules, for VLLM_BATCH_QUEUE_TRACE."""
+    return [
+        len(scheduler_output.num_scheduled_tokens),
+        scheduler_output.total_num_scheduled_tokens,
+    ]
+
+
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
@@ -117,6 +127,14 @@ class EngineCore:
         from vllm.plugins import load_general_plugins
 
         load_general_plugins()
+
+        # Before anything this constructor does can fail: an engine that dies
+        # setting up its caches is exactly a case the sampler has to cover,
+        # and starting it in the worker would miss it.
+        from vllm.utils import memory_log
+
+        memory_log.maybe_start()
+        memory_log.report("engine core init")
 
         self.vllm_config = vllm_config
         if not vllm_config.parallel_config.data_parallel_rank_local:
@@ -214,6 +232,10 @@ class EngineCore:
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+        # Lines for VLLM_BATCH_QUEUE_TRACE, written out in blocks.
+        self._batch_queue_trace: list[str] | None = (
+            [] if envs.VLLM_BATCH_QUEUE_TRACE and self.batch_queue is not None else None
+        )
 
         self.is_ec_consumer = (
             vllm_config.ec_transfer_config is None
@@ -319,8 +341,14 @@ class EngineCore:
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
         )
+        max_worker_kv_bytes_per_block = get_max_worker_kv_bytes_per_block(
+            kv_cache_configs
+        )
         for kv_cache_config in kv_cache_configs:
             kv_cache_config.kv_cache_layout = vllm_config.cache_config.kv_cache_layout
+            kv_cache_config.max_worker_kv_bytes_per_block = (
+                max_worker_kv_bytes_per_block
+            )
 
         # If auto-fit reduced max_model_len, sync the new value to workers.
         # This is needed because workers were spawned before memory profiling
@@ -659,6 +687,11 @@ class EngineCore:
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
+        trace: dict[str, Any] | None = (
+            {"t": time.monotonic(), "depth": len(batch_queue)}
+            if self._batch_queue_trace is not None
+            else None
+        )
 
         model_executed = False
         deferred_scheduler_output = None
@@ -668,6 +701,9 @@ class EngineCore:
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
+            if trace is not None:
+                trace["scheduled"] = _batch_size(scheduler_output)
+                trace["sent"] = time.monotonic()
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -697,6 +733,8 @@ class EngineCore:
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
+                    if trace is not None:
+                        self._record_batch_queue_step(trace)
                     return None, model_executed
 
         elif not batch_queue:
@@ -712,6 +750,10 @@ class EngineCore:
             self.log_error_detail(scheduler_output),
         ):
             model_output = future.result()
+            if trace is not None:
+                trace["waited"] = _batch_size(scheduler_output)
+                trace["wait_ms"] = round((time.monotonic() - trace["t"]) * 1000, 3)
+                self._record_batch_queue_step(trace)
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
@@ -750,6 +792,16 @@ class EngineCore:
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
+
+    def _record_batch_queue_step(self, trace: dict[str, Any]) -> None:
+        """One VLLM_BATCH_QUEUE_TRACE line, the file appended to every 500."""
+        lines = self._batch_queue_trace
+        assert lines is not None
+        lines.append(json.dumps(trace))
+        if len(lines) >= 500:
+            with open(envs.VLLM_BATCH_QUEUE_TRACE, "a") as f:  # type: ignore[arg-type]
+                f.write("\n".join(lines) + "\n")
+            lines.clear()
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():
@@ -803,6 +855,12 @@ class EngineCore:
         return self.scheduler.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    def close_prefix_cache_context(self, prefix: str) -> int:
+        """End a client context's thread, or every context under ``prefix``
+        (``CacheConfig.prefix_cache_context_threads``); a utility call."""
+        close = getattr(self.scheduler, "close_prefix_cache_context", None)
+        return close(prefix) if close is not None else 0
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.

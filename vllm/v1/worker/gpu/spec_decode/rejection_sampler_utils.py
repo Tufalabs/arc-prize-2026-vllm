@@ -1,9 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
+
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_block_argmax, tl_rand32
+
+# The vocabulary tile of _compute_local_logits_stats_kernel; the sampler's
+# top-k kernel can write the target's tile statistics itself (its fold), so
+# the two tile widths must agree.
+VOCAB_BLOCK_SIZE = 8192
 
 
 @triton.jit
@@ -223,6 +230,8 @@ def _compute_local_logits_stats_kernel(
     num_speculative_steps,
     BLOCK_SIZE: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
+    # The target's statistics were written by the sampler's top-k fold.
+    SKIP_TARGET: tl.constexpr,
 ):
     logit_idx = tl.program_id(0).to(tl.int64)
     draft_step_idx = tl.load(expanded_local_pos_ptr + logit_idx)
@@ -240,41 +249,43 @@ def _compute_local_logits_stats_kernel(
 
     if temp == 0.0:
         # Greedy sampling. Only the target max/argmax are needed.
-        target_logits = tl.load(
-            target_logits_ptr + logit_idx * target_logits_stride + block_offsets,
-            mask=mask,
-            other=float("-inf"),
-        ).to(tl.float32)
-        value, idx = tl.max(target_logits, axis=0, return_indices=True)
-        token_id = block_idx * BLOCK_SIZE + idx
-        tl.store(
-            target_local_argmax_ptr
-            + logit_idx * target_local_argmax_stride
-            + block_idx,
-            token_id,
-        )
-        tl.store(
-            target_local_max_ptr + logit_idx * target_local_max_stride + block_idx,
-            value,
-        )
+        if not SKIP_TARGET:
+            target_logits = tl.load(
+                target_logits_ptr + logit_idx * target_logits_stride + block_offsets,
+                mask=mask,
+                other=float("-inf"),
+            ).to(tl.float32)
+            value, idx = tl.max(target_logits, axis=0, return_indices=True)
+            token_id = block_idx * BLOCK_SIZE + idx
+            tl.store(
+                target_local_argmax_ptr
+                + logit_idx * target_local_argmax_stride
+                + block_idx,
+                token_id,
+            )
+            tl.store(
+                target_local_max_ptr + logit_idx * target_local_max_stride + block_idx,
+                value,
+            )
     else:
         # Get local target max and summed exponentials.
-        target_logits = tl.load(
-            target_logits_ptr + logit_idx * target_logits_stride + block_offsets,
-            mask=mask,
-            other=float("-inf"),
-        ).to(tl.float32)
-        target_max, target_sumexp = _compute_max_and_sumexp(target_logits)
-        tl.store(
-            target_local_max_ptr + logit_idx * target_local_max_stride + block_idx,
-            target_max,
-        )
-        tl.store(
-            target_local_sumexp_ptr
-            + logit_idx * target_local_sumexp_stride
-            + block_idx,
-            target_sumexp,
-        )
+        if not SKIP_TARGET:
+            target_logits = tl.load(
+                target_logits_ptr + logit_idx * target_logits_stride + block_offsets,
+                mask=mask,
+                other=float("-inf"),
+            ).to(tl.float32)
+            target_max, target_sumexp = _compute_max_and_sumexp(target_logits)
+            tl.store(
+                target_local_max_ptr + logit_idx * target_local_max_stride + block_idx,
+                target_max,
+            )
+            tl.store(
+                target_local_sumexp_ptr
+                + logit_idx * target_local_sumexp_stride
+                + block_idx,
+                target_sumexp,
+            )
         if HAS_DRAFT_LOGITS:
             # Get local draft max and summed exponentials. draft_logits is
             # stored pre-temperature, so apply scale first.
@@ -533,10 +544,13 @@ def _rejection_kernel(
     local_residual_mass_ptr,
     local_residual_mass_stride,
     vocab_num_blocks,
+    log_accept_threshold_single,
+    log_accept_threshold_acc,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
     SYNTHETIC_MODE: tl.constexpr,
     USE_BLOCK_VERIFICATION: tl.constexpr,
+    RELAXED_ACCEPTANCE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
@@ -593,7 +607,8 @@ def _rejection_kernel(
                     draft_sampled if accepted else target_argmax,
                 )
             elif USE_BLOCK_VERIFICATION:
-                # Block verification (Sun et al., 2024): https://arxiv.org/abs/2403.10444
+                # Block verification (Sun et al., 2024):
+                # https://arxiv.org/abs/2403.10444
                 prefix_joint_ratio = tl.exp(
                     tl.load(cumulative_log_p_ptr + logit_idx).to(tl.float32)
                 )
@@ -626,7 +641,8 @@ def _rejection_kernel(
                 accepted_length = tl.where(u <= h, i + 1, accepted_length)
                 tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
             else:
-                # Speculative decoding (Leviathan et al., 2023): https://arxiv.org/abs/2211.17192
+                # Speculative decoding (Leviathan et al., 2023):
+                # https://arxiv.org/abs/2211.17192
                 target_logprob, draft_logprob, target_lse, draft_lse = (
                     _compute_global_logprobs_and_logsumexp(
                         draft_sampled,
@@ -656,6 +672,15 @@ def _rejection_kernel(
                 if SYNTHETIC_MODE:
                     rate = tl.load(synthetic_conditional_rates_ptr + i)
                     accepted = u < rate
+                elif RELAXED_ACCEPTANCE:
+                    # SGLang's relaxed acceptance (--speculative-accept-
+                    # threshold-acc/-single): the ratio test against
+                    # threshold_acc * q(x), or a target probability of at
+                    # least threshold_single. Lossy; not the target's law.
+                    accepted = (
+                        target_logprob
+                        > tl.log(u) + log_accept_threshold_acc + draft_logprob
+                    ) | (target_logprob >= log_accept_threshold_single)
                 else:
                     # Probability ratio test: p(x) > u * q(x)
                     # Equivalent log form: log_p(x) > log(u) + log_q(x)
@@ -947,11 +972,20 @@ def rejection_sample(
     synthetic_conditional_rates: torch.Tensor | None = None,
     use_fp64: bool = False,
     use_block_verification: bool = False,
+    accept_threshold_single: float = 1.0,
+    accept_threshold_acc: float = 1.0,
+    # (argmax, max, sumexp) of the target per [logit, VOCAB_BLOCK_SIZE tile],
+    # already written by the sampler's top-k fold; None computes them here.
+    target_stats: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
     assert draft_logits is None or (
         draft_logits.ndim == 3 and draft_logits.stride(-1) == 1
     )
+    relaxed_acceptance = accept_threshold_single < 1.0 or accept_threshold_acc < 1.0
+    assert not relaxed_acceptance or (
+        synthetic_conditional_rates is None and not use_block_verification
+    ), "Relaxed acceptance applies to standard rejection sampling only."
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
     draft_logits_stride_0 = 0
@@ -966,48 +1000,56 @@ def rejection_sample(
     # Compute the per-vocab-block logits stats, such as target argmax
     # (for greedy requests), and target max + softmax exponential
     # (for non-greedy requests).
-    VOCAB_BLOCK_SIZE = 8192
     vocab_num_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK_SIZE)
     padded_vocab_num_blocks = triton.next_power_of_2(vocab_num_blocks)
-    target_local_argmax = target_logits.new_empty(
-        num_logits, vocab_num_blocks, dtype=torch.int64
-    )
-    target_local_max = target_logits.new_empty(
-        num_logits, vocab_num_blocks, dtype=torch.float32
-    )
-    target_local_sumexp = target_logits.new_empty(
-        num_logits, vocab_num_blocks, dtype=torch.float32
-    )
+    if target_stats is None:
+        target_local_argmax = target_logits.new_empty(
+            num_logits, vocab_num_blocks, dtype=torch.int64
+        )
+        target_local_max = target_logits.new_empty(
+            num_logits, vocab_num_blocks, dtype=torch.float32
+        )
+        target_local_sumexp = target_logits.new_empty(
+            num_logits, vocab_num_blocks, dtype=torch.float32
+        )
+    else:
+        target_local_argmax, target_local_max, target_local_sumexp = target_stats
+        assert target_local_max.shape == (num_logits, vocab_num_blocks), (
+            target_local_max.shape,
+            (num_logits, vocab_num_blocks),
+        )
     draft_local_max = target_logits.new_empty(
         num_logits, vocab_num_blocks, dtype=torch.float32
     )
     draft_local_sumexp = target_logits.new_empty(
         num_logits, vocab_num_blocks, dtype=torch.float32
     )
-    _compute_local_logits_stats_kernel[(num_logits, vocab_num_blocks)](
-        target_local_argmax,
-        target_local_argmax.stride(0),
-        target_local_max,
-        target_local_max.stride(0),
-        target_local_sumexp,
-        target_local_sumexp.stride(0),
-        draft_local_max,
-        draft_local_max.stride(0),
-        draft_local_sumexp,
-        draft_local_sumexp.stride(0),
-        target_logits,
-        target_logits.stride(0),
-        draft_logits,
-        draft_logits_stride_0,
-        draft_logits_stride_1,
-        expanded_idx_mapping,
-        expanded_local_pos,
-        temperature,
-        vocab_size,
-        num_speculative_steps,
-        BLOCK_SIZE=VOCAB_BLOCK_SIZE,
-        HAS_DRAFT_LOGITS=has_draft_logits,
-    )
+    if target_stats is None or has_draft_logits:
+        _compute_local_logits_stats_kernel[(num_logits, vocab_num_blocks)](
+            target_local_argmax,
+            target_local_argmax.stride(0),
+            target_local_max,
+            target_local_max.stride(0),
+            target_local_sumexp,
+            target_local_sumexp.stride(0),
+            draft_local_max,
+            draft_local_max.stride(0),
+            draft_local_sumexp,
+            draft_local_sumexp.stride(0),
+            target_logits,
+            target_logits.stride(0),
+            draft_logits,
+            draft_logits_stride_0,
+            draft_logits_stride_1,
+            expanded_idx_mapping,
+            expanded_local_pos,
+            temperature,
+            vocab_size,
+            num_speculative_steps,
+            BLOCK_SIZE=VOCAB_BLOCK_SIZE,
+            HAS_DRAFT_LOGITS=has_draft_logits,
+            SKIP_TARGET=target_stats is not None,
+        )
 
     # Precompute the running joint ratio and residual mass for block
     # verification.
@@ -1126,10 +1168,13 @@ def rejection_sample(
         local_residual_mass,
         local_residual_mass.stride(0) if local_residual_mass is not None else 0,
         vocab_num_blocks,
+        math.log(accept_threshold_single),
+        math.log(accept_threshold_acc),
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_LOGITS=has_draft_logits,
         SYNTHETIC_MODE=synthetic_conditional_rates is not None,
         USE_BLOCK_VERIFICATION=use_block_verification,
+        RELAXED_ACCEPTANCE=relaxed_acceptance,
         num_warps=1,
     )
 

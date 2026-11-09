@@ -10,6 +10,16 @@
 
 import torch
 
+from vllm.model_executor.layers.mamba.ops.gdn_fp8_state import (
+    SCALE_BYTES,
+    advance_rounding_seed,
+    check_fp8_state_layout,
+    is_fp8_state,
+    load_fp8_state_rows,
+    rounding_seed,
+    state_key_dim,
+    store_fp8_state_rows,
+)
 from vllm.triton_utils import tl, triton
 
 from .op import exp, log
@@ -189,6 +199,11 @@ def fused_recurrent_gated_delta_rule_fwd(
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if initial_state is not None and is_fp8_state(initial_state):
+        raise NotImplementedError(
+            "An FP8 GDN state goes through the packed decode or the fused "
+            "sigmoid-gating kernel, not fused_recurrent_gated_delta_rule"
+        )
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
@@ -263,6 +278,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     h0,
     ht,
     ssm_state_indices,
+    sr_seed,
     scale,
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr,
@@ -276,9 +292,11 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    KP: tl.constexpr,  # a head's bytes over V: K, or K + 4 for FP8 (gdn_fp8_state)
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     SPLIT_BATCH_HEAD_GRID: tl.constexpr,
+    STATE_FP8: tl.constexpr,
 ):
     if SPLIT_BATCH_HEAD_GRID:
         i_v, i_hv, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -303,8 +321,11 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
         return
 
     p_h0 = h0 + state_idx * stride_init_state_token
-    p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-    b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+    if STATE_FP8:
+        b_h = load_fp8_state_rows(p_h0 + i_hv * V * KP, o_v, o_k, mask_v, mask_k, K, V)
+    else:
+        p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+        b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     p_mixed = mixed_qkv + i_n * stride_mixed_qkv_tok
     q_off = i_h * K + o_k
@@ -336,8 +357,25 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
     p_ht = ht + state_idx * stride_final_state_token
-    p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+    if STATE_FP8:
+        rand_offsets = (
+            ((state_idx * HV + i_hv) * V + o_v[:, None]) * K + o_k[None, :]
+        ).to(tl.int32)
+        store_fp8_state_rows(
+            p_ht + i_hv * V * KP,
+            o_v,
+            o_k,
+            b_h,
+            mask_v,
+            mask_k,
+            tl.load(sr_seed),
+            rand_offsets,
+            K,
+            V,
+        )
+    else:
+        p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
 def fused_recurrent_gated_delta_rule_packed_decode(
@@ -404,7 +442,11 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         )
     if initial_state.stride(-1) != 1:
         raise ValueError("`initial_state` must be contiguous in the last dim.")
-    HV, V, K = initial_state.shape[-3:]
+    state_fp8 = is_fp8_state(initial_state)
+    if state_fp8:
+        check_fp8_state_layout(initial_state)
+    HV, V = initial_state.shape[-3:-1]
+    K = state_key_dim(initial_state)
     if a.shape[1] != HV or b.shape[1] != HV:
         raise ValueError(
             f"`a`/`b` must have shape [B, HV] with HV={HV} (got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)})."
@@ -449,6 +491,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     stride_final_state_token = initial_state.stride(0)
     stride_indices_seq = ssm_state_indices.stride(0)
 
+    sr_seed = rounding_seed(dev) if state_fp8 else None
+
     NV = triton.cdiv(V, BV)
     # CUDA limits grid Y/Z dimensions to 65535.
     split_batch_head_grid = B * HV > 65535
@@ -463,6 +507,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         h0=initial_state,
         ht=initial_state,
         ssm_state_indices=ssm_state_indices,
+        sr_seed=sr_seed,
         scale=scale,
         stride_mixed_qkv_tok=stride_mixed_qkv_tok,
         stride_a_tok=stride_a_tok,
@@ -476,12 +521,16 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         V=V,
         BK=BK,
         BV=BV,
+        KP=K + SCALE_BYTES if state_fp8 else K,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         SPLIT_BATCH_HEAD_GRID=split_batch_head_grid,
+        STATE_FP8=state_fp8,
         num_warps=num_warps,
         num_stages=num_stages,
     )
+    if sr_seed is not None:
+        advance_rounding_seed(sr_seed)
     return out, initial_state
 
 

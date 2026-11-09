@@ -46,9 +46,21 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.use_fused_multi_step_decode = False
+        # XKB_DRAFT_PRUNE: the draft prefill runs the drafter's post-attention
+        # part on the last-token rows only (set in load_model when the model
+        # supports it).
+        self.draft_prune = False
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
+        self.draft_prune = bool(getattr(self.model, "supports_draft_prune", False))
+        if self.draft_prune:
+            logger.info(
+                "XKB_DRAFT_PRUNE=%s: draft prefill runs the drafter's MLP and "
+                "final mixer (at 2 also the sparse attention queries and o_proj) "
+                "on the last-token rows only.",
+                getattr(self.model, "draft_prune_level", 1),
+            )
         if not self.supports_mm_inputs:
             return
 
@@ -380,6 +392,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        keep_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
@@ -412,6 +425,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 hidden_states=self.hidden_states[:num_tokens],
                 inputs_embeds=inputs_embeds,
             )
+            if keep_rows is not None:
+                model_inputs["keep_rows"] = keep_rows
             if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
                 # Draft prefill with PIECEWISE cudagraph (compiled PW or breakable),
                 # chosen inside run_pw_graph.
@@ -449,6 +464,22 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         sample_src_positions = positions + 1
         idx_mapping = self.idx_mapping[:num_reqs]
 
+        keep_rows = None
+        if self.draft_prune:
+            # XKB_DRAFT_PRUNE: the model's post-attention part runs on these
+            # rows and returns them in order, so row i is request i's last
+            # token. Piecewise (breakable) graphs are keyed by num_tokens
+            # alone and captured with min(num_tokens, max_num_reqs) requests,
+            # so they keep that many rows; prepare_prefill_inputs pads the
+            # indices past num_reqs with 0. FULL graphs and eager runs are
+            # built for this num_reqs.
+            num_keep = (
+                min(num_tokens, self.max_num_reqs)
+                if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+                else num_reqs
+            )
+            keep_rows = self.last_token_indices[:num_keep]
+
         last_hidden_states, hidden_states = self._run_model(
             num_tokens,
             attn_metadata,
@@ -456,9 +487,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
+            keep_rows=keep_rows,
         )
 
-        sample_hidden_states = last_hidden_states[last_token_indices]
+        if keep_rows is not None:
+            sample_hidden_states = last_hidden_states[:num_reqs]
+        else:
+            sample_hidden_states = last_hidden_states[last_token_indices]
         self.draft_tokens[:num_reqs, 0] = self.sample_draft(
             sample_hidden_states,
             sample_src_positions,
@@ -470,6 +505,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
         if last_hidden_states is hidden_states:
             self.hidden_states[:num_reqs] = sample_hidden_states
+        elif keep_rows is not None:
+            self.hidden_states[:num_reqs] = hidden_states[:num_reqs]
         else:
             self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
         self.input_buffers.positions[:num_reqs] = positions

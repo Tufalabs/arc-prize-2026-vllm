@@ -318,3 +318,49 @@ def test_copy_kv_cache_blocks_with_virtual_block_splitting(
             torch.testing.assert_close(
                 cache[dst_start + physical_idx], expected[layer_idx][physical_idx]
             )
+
+
+@pytest.mark.parametrize("sources_are_targets", [False, True])
+def test_block_copies_go_in_bounded_chunks(monkeypatch, sources_are_targets):
+    """A step's copies are gathered a chunk at a time, so a burst of them never
+    needs all their sources in memory at once; a batch where a target is
+    also a source is copied in one gather, which reads every source first."""
+    import vllm.v1.worker.utils as worker_utils
+
+    # The indices are staged through pinned memory, which needs a GPU.
+    monkeypatch.setattr(
+        worker_utils,
+        "async_tensor_h2d",
+        lambda data, device, **_: torch.as_tensor(data, device=device),
+    )
+    num_blocks, block_numel = 12, 5
+    cache = torch.arange(num_blocks * block_numel, dtype=torch.float32).view(
+        num_blocks, block_numel
+    )
+    block_bytes = block_numel * cache.element_size()
+    monkeypatch.setattr(worker_utils, "_MAX_BLOCK_COPY_CHUNK_BYTES", 2 * block_bytes)
+    if sources_are_targets:
+        pairs = [(0, 1), (1, 2), (2, 3)]
+    else:
+        pairs = [(0, 6), (1, 7), (2, 8), (3, 9), (4, 10)]
+    copies = [KVCacheBlockCopy(src_block_id=s, dst_block_id=d) for s, d in pairs]
+    expected = cache.clone()
+    src = torch.tensor([s for s, _ in pairs])
+    dst = torch.tensor([d for _, d in pairs])
+    expected[dst] = expected[src].clone()
+
+    gathered = []
+    real_getitem = torch.Tensor.__getitem__
+
+    def spy(self, index):
+        out = real_getitem(self, index)
+        if isinstance(index, torch.Tensor) and index.dtype == torch.int64:
+            gathered.append(index.numel())
+        return out
+
+    monkeypatch.setattr(torch.Tensor, "__getitem__", spy)
+    worker_utils.copy_kv_cache_blocks_inplace([cache], num_blocks, copies)
+    monkeypatch.setattr(torch.Tensor, "__getitem__", real_getitem)
+
+    torch.testing.assert_close(cache, expected)
+    assert gathered == ([3] if sources_are_targets else [2, 2, 1])

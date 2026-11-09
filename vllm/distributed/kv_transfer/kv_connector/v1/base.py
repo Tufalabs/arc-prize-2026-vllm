@@ -481,6 +481,38 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def fill_divergent_hit(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        lagging_group_ids: tuple[int, ...],
+    ) -> bool:
+        """
+        Whether the connector will supply, for each of `lagging_group_ids`,
+        the single state block at the boundary `num_computed_tokens`.
+
+        A hybrid model's per-group prefix hits can diverge: the
+        full-attention prefix is still resident up to `num_computed_tokens`
+        while a recurrent group's state at that boundary has been evicted.
+        The scheduler asks this only after `get_num_new_matched_tokens`
+        returned 0 for such a request, i.e. nothing beyond the attention hit
+        could be loaded either. Returning True commits the connector to
+        loading those blocks asynchronously: the scheduler keeps the deeper
+        hit, allocates one block per lagging group at its last chunk, calls
+        `update_state_after_alloc` with `num_external_tokens == 0`, and holds
+        the request in WAITING_FOR_REMOTE_KVS until the connector reports it
+        received. Returning False makes the scheduler fall back to the
+        boundary every group agrees on. Default: False.
+
+        Args:
+            request (Request): the request object.
+            num_computed_tokens (int): the block-aligned local hit, which is
+                the full-attention group's.
+            lagging_group_ids (tuple[int, ...]): the kv cache groups whose
+                local hit fell short of it.
+        """
+        return False
+
     @abstractmethod
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

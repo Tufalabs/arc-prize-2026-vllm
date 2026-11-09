@@ -80,13 +80,16 @@ def _split(
     request: Request,
     num_new_tokens: int,
     use_eagle: bool = True,
+    use_eagle_block_drop: bool | None = None,
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
+    if use_eagle_block_drop is None:
+        use_eagle_block_drop = use_eagle
     stub = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
-        use_eagle=use_eagle,
+        mamba_block_size=MAMBA_BLOCK_SIZE,
+        use_eagle_block_drop=use_eagle_block_drop,
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         # `prefix_match_unit` finer than the block size (#46384).
@@ -126,6 +129,16 @@ def test_internal_checkpoint_split(
         mamba_manager = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
         blocks = mamba_manager.req_to_blocks[request.request_id]
         assert all(not block.is_null for block in blocks)  # checkpoint + running state
+
+
+def test_disabling_eagle_block_drop_keeps_the_trailing_cache_boundary() -> None:
+    (request,) = create_requests(1, num_tokens=3602, block_size=ATTN_BLOCK_SIZE)
+
+    with_drop = _split(request, request.num_tokens, use_eagle_block_drop=True)
+    without_drop = _split(request, request.num_tokens, use_eagle_block_drop=False)
+
+    assert with_drop == MAMBA_BLOCK_SIZE
+    assert without_drop == 2 * MAMBA_BLOCK_SIZE
 
 
 def _run_chunked_prefill(
@@ -294,3 +307,150 @@ def test_unaligned_resume_never_runs_past_its_block(
             f"intermediate chunk end {end} is neither block-aligned nor the "
             f"partial-tail boundary"
         )
+
+
+# zero_recurrent_state: the blank is applied by the worker only on a step whose
+# running state STANDS at the target, so the split has to cut a chunk that would
+# stride across it. Without the cut the request prefills straight past, no step
+# ever stands there, and the blank is skipped with nothing to say so.
+
+
+def _armed(request: Request, **kwargs) -> Request:
+    """Arm `request` for a blank, in place."""
+    assert request.sampling_params is not None
+    request.sampling_params.zero_recurrent_state = True
+    for name, value in kwargs.items():
+        setattr(request.sampling_params, name, value)
+    return request
+
+
+@pytest.mark.parametrize("target", [1568, MAMBA_BLOCK_SIZE, MAMBA_BLOCK_SIZE + 7])
+def test_split_stops_on_the_blank_target(target: int):
+    """A chunk that would stride across the target ends exactly there —
+    including targets off a mamba block boundary, which the alignment rule
+    would otherwise carry straight past."""
+    (request,) = create_requests(1, num_tokens=PROMPT_LEN, block_size=ATTN_BLOCK_SIZE)
+    _armed(request, zero_recurrent_at=target)
+    assert _split(request, PROMPT_LEN) == target
+
+
+def test_split_ignores_the_target_once_it_is_behind():
+    """Past the target there is nothing left to stand on, so the alignment
+    rule governs alone: the armed request is cut exactly where an unarmed one
+    is (here the mamba block boundary), not at the target it has gone by."""
+    (control,) = create_requests(1, num_tokens=PROMPT_LEN, block_size=ATTN_BLOCK_SIZE)
+    control.num_computed_tokens = 200
+    (request,) = create_requests(1, num_tokens=PROMPT_LEN, block_size=ATTN_BLOCK_SIZE)
+    _armed(request, zero_recurrent_at=100)
+    request.num_computed_tokens = 200
+    aligned = _split(control, PROMPT_LEN - 200)
+    assert 200 + aligned == MAMBA_BLOCK_SIZE, "expected the stock block-boundary cut"
+    assert _split(request, PROMPT_LEN - 200) == aligned
+
+
+def test_split_is_unchanged_when_the_blank_is_not_asked_for():
+    """The control the arming tests are read against: same request, same
+    budget, no blank — an unarmed request takes the stock path."""
+    (request,) = create_requests(1, num_tokens=PROMPT_LEN, block_size=ATTN_BLOCK_SIZE)
+    baseline = _split(request, PROMPT_LEN)
+    (armed_request,) = create_requests(
+        1, num_tokens=PROMPT_LEN, block_size=ATTN_BLOCK_SIZE
+    )
+    _armed(armed_request, zero_recurrent_at=1568)
+    assert _split(armed_request, PROMPT_LEN) == 1568
+    assert baseline != 1568, "the target must not coincide with the stock cut"
+    assert _split(request, PROMPT_LEN) == baseline
+
+
+def _make_scheduler_with_ring_group(max_num_batched_tokens: int) -> Scheduler:
+    """Hybrid scheduler whose smallest group is a 4-token ring (QSA raw keys)
+    beside 1568-token align-mode Mamba and MLA groups, the way the engine
+    core hands it over: `cache_config.block_size` is the minimum over groups."""
+    from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
+    from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, MLAAttentionSpec
+    from vllm.v1.structured_output import StructuredOutputManager
+
+    recurrent_block, ring_block = 1568, 4
+    vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=8192,
+            enable_chunked_prefill=True,
+            is_encoder_decoder=False,
+            watermark=0.0,
+        ),
+        model_config=ModelConfig(
+            model="facebook/opt-125m",
+            trust_remote_code=True,
+            dtype="float16",
+            seed=42,
+            skip_tokenizer_init=True,
+        ),
+        cache_config=CacheConfig(
+            block_size=ring_block, enable_prefix_caching=True, mamba_cache_mode="align"
+        ),
+    )
+    vllm_config.cache_config.num_gpu_blocks = 100
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["gdn"],
+                MambaSpec(
+                    block_size=recurrent_block,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["ring"],
+                CircularBufferSpec(
+                    block_size=ring_block,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mla"],
+                MLAAttentionSpec(
+                    block_size=recurrent_block,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+        ],
+    )
+    register_all_kvcache_specs(vllm_config)
+    return Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+        block_size=recurrent_block,
+        hash_block_size=recurrent_block,
+        log_stats=True,
+    )
+
+
+@pytest.mark.parametrize("max_num_batched_tokens", [2048, 8192])
+def test_split_aligns_to_the_recurrent_block_not_the_smallest_group(
+    max_num_batched_tokens: int,
+) -> None:
+    """A 4-token ring group beside 1568-token Mamba groups: the chunk split
+    must land on the Mamba boundary (1568, 3136, ...) so the state published at
+    the chunk end sits in the slot the invariant promises. Aligned to the ring
+    instead, a whole-prompt chunk ends past the last boundary and leaves every
+    full block null (no prefix hit); a 2048-budget chunk ends mid-block and a
+    later hit restores a state short of its boundary."""
+    scheduler = _make_scheduler_with_ring_group(max_num_batched_tokens)
+    (request,) = create_requests(1, num_tokens=4 * 1568 + 343, block_size=1568)
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    chunk = output.num_scheduled_tokens[request.request_id]
+    assert chunk % 1568 == 0, chunk
+    assert chunk == (1568 if max_num_batched_tokens == 2048 else 4 * 1568)

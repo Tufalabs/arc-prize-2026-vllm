@@ -288,6 +288,14 @@ class SchedulerOutput:
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
+    # Decode-tail targets under speculative decoding with GDN RecoverSSM
+    # (KVCacheConfig.decode_tail_mode "recover"): request -> {kv cache group
+    # id: (boundary, snapshot block id)}. The worker keeps a group's target
+    # for the request until it is replaced or cleared (boundary 0), and the
+    # group's RecoverSSM commit writes the state at the boundary into the
+    # snapshot block when a verify window crosses it.
+    decode_tail_targets: dict[str, dict[int, tuple[int, int]]] | None = None
+
     # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None
 

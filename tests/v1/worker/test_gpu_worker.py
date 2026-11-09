@@ -6,7 +6,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 
+from tests.utils import create_new_process_for_each_test
+from vllm.platforms import current_platform
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import gpu_worker, startup_plan
 from vllm.v1.worker.gpu_worker import maybe_rocm_profiling_fallback
@@ -14,6 +17,105 @@ from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike()
+    or not torch.accelerator.is_available()
+    or torch.cuda.memory.get_allocator_backend() != "native",
+    reason="needs the native CUDA or ROCm allocator",
+)
+# A fresh allocator: blocks cached by earlier tests could serve the large buffer.
+@create_new_process_for_each_test("spawn")
+def test_scoped_max_split_keeps_freed_large_blocks_releasable():
+    """A small allocation made after a large buffer is freed must not pin the
+    buffer's segment: the profiling run (determine_available_memory) grows
+    workspaces this way, and a pinned segment survives empty_cache() and is
+    counted as consumed memory."""
+    large = 512 * 1024 * 1024
+    small = 2 * 1024 * 1024  # large pool, so it is served by splitting cached blocks
+
+    def reserved_while_small_is_live(scope) -> int:
+        torch.accelerator.empty_cache()
+        with scope:
+            buf = torch.empty(large, dtype=torch.uint8, device="cuda")
+            del buf
+            tensor = torch.empty(small, dtype=torch.uint8, device="cuda")
+            torch.accelerator.empty_cache()
+            reserved = torch.accelerator.memory_reserved()
+            del tensor
+        torch.accelerator.empty_cache()
+        return reserved
+
+    baseline = torch.accelerator.memory_reserved()
+    # Without the limit the small tensor is split off the freed block and pins it.
+    assert reserved_while_small_is_live(nullcontext()) - baseline >= large
+    scoped = gpu_worker.Worker._scoped_allocator_max_split(
+        SimpleNamespace(), max_split_size_mb=20
+    )
+    assert reserved_while_small_is_live(scoped) - baseline < large
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike()
+    or not torch.accelerator.is_available()
+    or torch.cuda.memory.get_allocator_backend() != "native",
+    reason="needs the native CUDA or ROCm allocator",
+)
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("snapshot_fallback", [False, True])
+@pytest.mark.parametrize("suffix", ["", ", "])
+def test_scoped_max_split_preserves_allocator_settings(
+    monkeypatch, fail, snapshot_fallback, suffix
+):
+    """Preserve allocator settings across successful and failed profiling runs."""
+    if snapshot_fallback:
+        monkeypatch.delattr(
+            torch._C, "_accelerator_getAllocatorSettings", raising=False
+        )
+
+    def settings():
+        return torch.cuda.memory._snapshot()["allocator_settings"]
+
+    original = settings()["PYTORCH_CUDA_ALLOC_CONF"]
+    configured = (
+        "max_split_size_mb:128,garbage_collection_threshold:0.8,"
+        "roundup_power2_divisions:[256:1,512:2,>:4],max_non_split_rounding_mb:32"
+    )
+    try:
+        torch._C._accelerator_setAllocatorSettings(configured + suffix)
+        before = settings()
+        expected_error = pytest.raises(RuntimeError, match="profiling failed")
+        with (
+            expected_error if fail else nullcontext(),
+            gpu_worker.Worker._scoped_allocator_max_split(SimpleNamespace(), 20),
+        ):
+            scoped = settings()
+            assert scoped["max_split_size"] == 20 * 1024 * 1024
+            for key in ("garbage_collection_threshold", "roundup_power2_divisions"):
+                assert scoped[key] == before[key]
+            if fail:
+                raise RuntimeError("profiling failed")
+        assert settings() == before
+    finally:
+        torch._C._accelerator_setAllocatorSettings(original)
+
+
+def test_scoped_max_split_ignores_async_allocator(monkeypatch):
+    """Async allocators ignore max_split and may not support memory snapshots."""
+    monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda.memory, "get_allocator_backend", lambda: "cudaMallocAsync"
+    )
+    with (
+        patch.object(torch.cuda.memory, "_snapshot") as snapshot,
+        patch.object(torch._C, "_accelerator_setAllocatorSettings") as set_settings,
+        gpu_worker.Worker._scoped_allocator_max_split(SimpleNamespace(), 20),
+    ):
+        pass
+    snapshot.assert_not_called()
+    set_settings.assert_not_called()
+
 
 # Startup-plan persistence (vllm/v1/worker/startup_plan.py), applied and
 # saved by Worker.determine_available_memory / compile_or_warm_up_model.
@@ -153,6 +255,82 @@ def test_profiling_fallback_declines_off_rocm(rocm):
     result = _profile_result(consumed=-RELEASED_BY_OTHERS)
 
     assert maybe_rocm_profiling_fallback(result) is None
+
+
+REQUESTED = 20 * GiB_bytes
+NON_KV = 6 * GiB_bytes
+GRAPH_ESTIMATE = 1 * GiB_bytes
+
+
+@pytest.mark.parametrize("estimate_applied", [True, False])
+def test_the_graph_profile_runs_only_when_its_estimate_is_applied(
+    monkeypatch: pytest.MonkeyPatch, estimate_applied: bool
+):
+    """The memory profiler's graph capture is itself a capture of the graphs;
+    with VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 its estimate is discarded,
+    so it is not run and the graphs are captured once, after the KV cache."""
+    from contextlib import contextmanager
+
+    from vllm.config import CUDAGraphMode
+
+    calls: list[str] = []
+
+    @contextmanager
+    def fake_profiling(*args, **kwargs):
+        yield SimpleNamespace(
+            total_consumed=NON_KV,
+            transient_peak_headroom=0,
+            non_kv_cache_memory=NON_KV,
+            after_profile=_snapshot(ANY_FREE_MEMORY - NON_KV),
+        )
+
+    def profile_cudagraph_memory() -> int:
+        calls.append("profile_cudagraph_memory")
+        return GRAPH_ESTIMATE
+
+    monkeypatch.setattr(
+        gpu_worker.envs, "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", estimate_applied
+    )
+    monkeypatch.setattr(gpu_worker, "memory_profiling", fake_profiling)
+    monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", lambda worker: None)
+    monkeypatch.setattr(
+        gpu_worker, "maybe_rocm_profiling_fallback", lambda result: None
+    )
+    monkeypatch.setattr(gpu_worker, "reserve_mm_ipc_gpu_memory", lambda kv, *args: kv)
+    monkeypatch.setattr(
+        gpu_worker, "current_platform", SimpleNamespace(is_cuda_alike=lambda: True)
+    )
+    worker = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            kv_cache_memory_bytes=None, gpu_memory_utilization=0.9
+        ),
+        init_snapshot=SimpleNamespace(
+            free_memory=ANY_FREE_MEMORY, total_memory=ANY_FREE_MEMORY
+        ),
+        requested_memory=REQUESTED,
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+            )
+        ),
+        model_config=SimpleNamespace(multimodal_config=None),
+        parallel_config=SimpleNamespace(),
+        model_runner=SimpleNamespace(
+            model_memory_usage=0,
+            profile_run=lambda: calls.append("profile_run"),
+            profile_cudagraph_memory=profile_cudagraph_memory,
+        ),
+        _scoped_allocator_max_split=lambda max_split_size_mb: nullcontext(),
+    )
+
+    available = gpu_worker.Worker.determine_available_memory(worker)
+
+    if estimate_applied:
+        assert calls == ["profile_run", "profile_cudagraph_memory"]
+        assert available == REQUESTED - NON_KV - GRAPH_ESTIMATE
+    else:
+        assert calls == ["profile_run"]
+        assert available == REQUESTED - NON_KV
 
 
 class _OrderedHandle:

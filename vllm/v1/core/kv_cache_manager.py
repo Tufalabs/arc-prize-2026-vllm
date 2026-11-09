@@ -9,6 +9,7 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.context_threads import ContextThreads
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
@@ -167,6 +168,14 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        # CacheConfig.prefix_cache_context_threads.
+        self.context_threads = (
+            ContextThreads(self.block_pool, self.coordinator.single_type_managers)
+            if kv_cache_config.prefix_cache_context_threads and enable_caching
+            else None
+        )
+        # A host tier bound to the pool reads the threads from there.
+        self.block_pool.context_threads = self.context_threads
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -295,7 +304,7 @@ class KVCacheManager:
 
     def get_computed_blocks_for_connector(
         self, request: Request
-    ) -> tuple[KVCacheBlocks, int, int, bool]:
+    ) -> tuple[KVCacheBlocks, int, int, tuple[int, ...]]:
         """Local prefix-cache lookup for a request scheduled with a KV connector.
 
         Hybrid (Mamba + full-attention) models can have per-group prefix hits
@@ -305,14 +314,18 @@ class KVCacheManager:
         remaining suffix and the Mamba state is transferred unconditionally by
         nixl's ``_apply_prefix_caching`` - and flag when that hit ran deeper
         than a lagging group. Such a hit only has a valid Mamba state at its
-        boundary if the connector supplies it, so the caller must fall back to
-        ``get_computed_blocks`` to reconcile when no external tokens are found.
+        boundary if the connector supplies it — beyond the hit through
+        ``get_num_new_matched_tokens``, or at the boundary itself through
+        ``fill_divergent_hit`` — so the caller must fall back to
+        ``get_computed_blocks`` to reconcile when it supplies neither.
 
         Non-hybrid models and already-convergent hits use ``get_computed_blocks``.
 
         Returns:
             The ``get_computed_blocks`` triple (blocks, number of local computed
-            tokens, shared-prefix boundary) plus ``hit_diverged``.
+            tokens, shared-prefix boundary) plus the per-group hit lengths when
+            the hit diverged — a lagging group is one whose length is below the
+            full-attention one — and an empty tuple when it did not.
         """
         coordinator = self.coordinator
         if not (
@@ -320,10 +333,10 @@ class KVCacheManager:
             and isinstance(coordinator, HybridKVCacheCoordinator)
             and coordinator.full_attention_group_id is not None
         ):
-            return *self.get_computed_blocks(request), False
+            return *self.get_computed_blocks(request), ()
 
         if not self.prefix_cache_lookup_enabled(request):
-            return self.empty_kv_cache_blocks, 0, 0, False
+            return self.empty_kv_cache_blocks, 0, 0, ()
 
         fa_group_id = coordinator.full_attention_group_id
         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
@@ -333,12 +346,40 @@ class KVCacheManager:
             # A lagging group hit deeper than full attention means its
             # full-attention blocks were evicted; use the reconciled boundary
             # that every group agrees on.
-            return *self.get_computed_blocks(request), False
+            return *self.get_computed_blocks(request), ()
 
         num_local = per_group_hits[fa_group_id]
         blocks = self.create_kv_cache_blocks(computed)
+        diverged = min(per_group_hits) < num_local
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
-        return blocks, num_local, 0, min(per_group_hits) < num_local
+        return blocks, num_local, 0, tuple(per_group_hits) if diverged else ()
+
+    def drop_computed_groups(
+        self, blocks: KVCacheBlocks, group_ids: tuple[int, ...]
+    ) -> KVCacheBlocks:
+        """A lookup-result view with the given groups' blocks removed, for a
+        divergent hit the connector fills: those groups' shallower local hits
+        are not adopted, and their boundary block is allocated instead.
+
+        Pure slicing: refcounts are untouched and ``blocks`` is not mutated.
+        """
+        return self.create_kv_cache_blocks(
+            tuple(
+                [] if group_id in group_ids else list(group_blocks)
+                for group_id, group_blocks in enumerate(blocks.blocks)
+            )
+        )
+
+    def get_fill_block_ids(
+        self, request_id: str, group_ids: tuple[int, ...]
+    ) -> list[int]:
+        """The block ids a divergent-hit fill loads into: the last block of
+        each filled group, allocated by ``allocate_slots`` for the boundary."""
+        managers = self.coordinator.single_type_managers
+        return [
+            managers[group_id].req_to_blocks[request_id][-1].block_id
+            for group_id in group_ids
+        ]
 
     def allocate_slots(
         self,
@@ -353,6 +394,7 @@ class KVCacheManager:
         full_sequence_must_fit: bool = False,
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
+        fill_group_ids: tuple[int, ...] = (),
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -437,8 +479,14 @@ class KVCacheManager:
             A list of new allocated blocks.
         """
         # When loading KV data asynchronously, we may have zero new tokens to
-        # compute while still allocating slots for externally computed tokens.
-        if num_new_tokens == 0 and num_external_computed_tokens == 0:
+        # compute while still allocating slots for externally computed tokens —
+        # or, for a divergent hit the connector fills (`fill_group_ids`), for
+        # the lagging groups' block at the boundary of the local hit.
+        if (
+            num_new_tokens == 0
+            and num_external_computed_tokens == 0
+            and not fill_group_ids
+        ):
             raise ValueError(
                 "num_new_tokens must be greater than 0 when there are no "
                 "external computed tokens"
@@ -528,6 +576,7 @@ class KVCacheManager:
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
             or num_external_computed_tokens > 0
+            or fill_group_ids
         ):
             # Append the new computed blocks to the request blocks until now to
             # avoid the case where the new blocks cannot be allocated.
@@ -536,6 +585,7 @@ class KVCacheManager:
                 new_computed_blocks=new_computed_block_list,
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
+                fill_group_ids=fill_group_ids,
             )
 
         new_blocks = self.coordinator.allocate_new_blocks(
@@ -544,6 +594,8 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        if self.context_threads is not None:
+            self.context_threads.on_allocated(request, new_computed_block_list)
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -571,7 +623,23 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        freed = (
+            self.context_threads.before_free(request)
+            if self.context_threads is not None
+            else None
+        )
         self.coordinator.free(request.request_id)
+        if freed is not None:
+            assert self.context_threads is not None
+            self.context_threads.after_free(freed)
+
+    def close_prefix_cache_context(self, prefix: str) -> int:
+        """End a client context, or every context under ``prefix``
+        (``CacheConfig.prefix_cache_context_threads``): its cached blocks go
+        to the eviction end. Returns how many moved."""
+        if self.context_threads is None:
+            return 0
+        return self.context_threads.close(prefix)
 
     def remove_skipped_blocks(
         self,
@@ -603,7 +671,16 @@ class KVCacheManager:
         Returns:
             The request's blocks in allocation order.
         """
-        return self.coordinator.pop_blocks_for_free(request.request_id)
+        freed = (
+            self.context_threads.before_free(request)
+            if self.context_threads is not None
+            else None
+        )
+        blocks = self.coordinator.pop_blocks_for_free(request.request_id)
+        if freed is not None:
+            assert self.context_threads is not None
+            self.context_threads.after_free(freed)
+        return blocks
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -847,6 +924,17 @@ class KVCacheManager:
         ]
         retained_blocks = [block for pair in pending_copies for block in pair]
         return copies, retained_blocks
+
+    def take_decode_tail_targets(self) -> dict[str, dict[int, tuple[int, int]]]:
+        """Drain this step's decode-tail targets for the worker
+        (``KVCacheConfig.decode_tail_mode`` "recover"): request -> {kv cache
+        group id: (boundary, snapshot block id)}; boundary 0 clears that
+        group's target."""
+        targets: dict[str, dict[int, tuple[int, int]]] = {}
+        for mgr in self.coordinator.single_type_managers:
+            for req_id, update in mgr.take_decode_tail_updates().items():
+                targets.setdefault(req_id, {})[mgr.kv_cache_group_id] = update
+        return targets
 
     def take_boundary_state_offloads(
         self,

@@ -424,3 +424,102 @@ def test_logits_cache_narrower_than_logits_is_rejected():
             logits_cache=cache,
             logits_cache_col=torch.tensor(0, dtype=torch.int32, device=DEVICE),
         )
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.6, 1.0])
+@torch.inference_mode()
+def test_compact_draft_sampling_uses_target_ids_for_noise(temperature: float):
+    """A reduced, permuted vocabulary must retain the dense sampler's draws."""
+    from vllm.v1.worker.gpu.spec_decode.sparse_sampler import draft_sample_compact
+
+    rows, vocab, compact = 24, 248_320, 16_384
+    gen = torch.Generator(device=DEVICE).manual_seed(71)
+    targets = torch.randperm(vocab, generator=gen, device=DEVICE)[:compact].to(
+        torch.int32
+    )
+    logits = torch.randn(rows, compact, generator=gen, device=DEVICE)
+    logits[-1].zero_()
+    full = torch.full((rows, vocab), -float("inf"), device=DEVICE)
+    full[:, targets.long()] = logits
+    mapping = torch.arange(rows, dtype=torch.int32, device=DEVICE).flip(0)
+    seeds = torch.arange(rows, dtype=torch.int64, device=DEVICE) + 1000
+    pos = torch.arange(rows, dtype=torch.int64, device=DEVICE) + 1049
+    temp = torch.full((rows,), temperature, device=DEVICE)
+    cache = torch.empty(rows, 1, compact, device=DEVICE)
+    lse = torch.empty(rows, 1, device=DEVICE)
+    sampled = draft_sample_compact(
+        logits,
+        targets,
+        mapping,
+        temp,
+        seeds,
+        pos,
+        cache,
+        lse,
+        torch.tensor(0, dtype=torch.int32, device=DEVICE),
+    )
+    expected = gumbel_sample(
+        full,
+        mapping,
+        temp,
+        seeds,
+        pos,
+        apply_temperature=True,
+        is_drafting=True,
+    )
+    torch.testing.assert_close(sampled, expected, atol=0, rtol=0)
+    torch.testing.assert_close(cache[mapping, 0], logits, atol=0, rtol=0)
+    if temperature:
+        torch.testing.assert_close(
+            lse[mapping, 0],
+            torch.logsumexp(logits / temperature, -1),
+            atol=2e-5,
+            rtol=2e-6,
+        )
+
+
+@torch.inference_mode()
+def test_folded_topk_keeps_the_dense_support_for_sparse_and_fallback_rows():
+    """Tie-heavy and large-top-k rows must take the dense fallback correctly."""
+    from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
+
+    rows, vocab = 6, 248_320
+    gen = torch.Generator(device=DEVICE).manual_seed(53)
+    logits = torch.randn(rows, vocab, device=DEVICE, generator=gen).bfloat16()
+    logits[-1].zero_()
+    temperature = torch.tensor([0.6, 1.0, 0.0], device=DEVICE)
+    mapping = torch.tensor([0, 1, 2, 0, 1, 2], device=DEVICE)
+    topk = torch.tensor([1, 194, 512, 194, 512, 194], dtype=torch.int32, device=DEVICE)
+    reference = logits.float()
+    from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
+
+    apply_temperature(reference, mapping, temperature)
+    apply_top_k_top_p_triton(reference, topk, None)
+    out = torch.empty_like(reference)
+    tiles = (vocab + 8191) // 8192
+    stats = (
+        torch.empty(rows, tiles, dtype=torch.int64, device=DEVICE),
+        torch.empty(rows, tiles, device=DEVICE),
+        torch.empty(rows, tiles, device=DEVICE),
+    )
+    candidates = (
+        torch.empty(rows, 256, dtype=torch.int32, device=DEVICE),
+        torch.empty(rows, 256, device=DEVICE),
+        torch.empty(rows, dtype=torch.int32, device=DEVICE),
+    )
+    apply_top_k_top_p_triton(
+        logits,
+        topk,
+        None,
+        fold=(out, temperature, mapping, stats),
+        cand=candidates,
+        cand_fast=True,
+    )
+    ids, values, counts = candidates
+    reconstructed = torch.full_like(reference, -float("inf"))
+    for row, count in enumerate(counts.tolist()):
+        if count <= 256:
+            reconstructed[row, ids[row, :count].long()] = values[row, :count]
+        else:
+            reconstructed[row] = out[row]
+    torch.testing.assert_close(reconstructed, reference, atol=0, rtol=0)

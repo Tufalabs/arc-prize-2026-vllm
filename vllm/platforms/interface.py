@@ -775,7 +775,13 @@ class Platform:
         """
         from math import lcm
 
-        from vllm.config.vllm import set_current_vllm_config
+        from vllm.config.vllm import (
+            get_layers_from_vllm_config,
+            set_current_vllm_config,
+        )
+        from vllm.model_executor.layers.attention_layer_base import (
+            AttentionLayerBase,
+        )
         from vllm.model_executor.models import ModelRegistry
         from vllm.utils.math_utils import cdiv
         from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
@@ -849,6 +855,22 @@ class Platform:
             attn_page_size_1_token = backend_cls.customize_spec(
                 attn_spec
             ).page_size_bytes
+
+        # Layers that put more in a block than the backend's spec describes
+        # (Qwen4Exp's QSA: its quantized cell as stored and a compressed-key
+        # row) say what a token takes; the block is sized from that, so the
+        # recurrent pages are padded to what the attention group holds.
+        with set_current_vllm_config(vllm_config):
+            layer_bytes = [
+                count
+                for layer in get_layers_from_vllm_config(
+                    vllm_config,
+                    AttentionLayerBase,  # type: ignore[type-abstract]
+                ).values()
+                if (count := layer.kv_bytes_per_token(vllm_config)) is not None
+            ]
+        if layer_bytes:
+            attn_page_size_1_token = max(layer_bytes)
 
         # Compute mamba page size
         model_cls, _ = ModelRegistry.resolve_model_cls(
