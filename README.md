@@ -14,6 +14,22 @@ Easy, fast, and cheap LLM serving for everyone
 | <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
 </p>
 
+> **This is Tufa Labs' fork of vLLM v0.29.0**, used by our ARC Prize 2026 solvers.
+> [TUFA.md](TUFA.md) lists what it changes. `uv pip install vllm` installs upstream,
+> which does not have these changes.
+>
+> To run the solvers, use `make install-dev` in
+> [arc-prize-2026](https://github.com/Tufalabs/arc-prize-2026), which pins this fork.
+> To install the fork on its own:
+>
+> ```bash
+> VLLM_USE_PRECOMPILED=1 \
+> VLLM_PRECOMPILED_WHEEL_COMMIT=98dff2a81d747d1dba01a47f939f48c3526d4206 \
+>   uv pip install "vllm @ git+https://github.com/Tufalabs/arc-prize-2026-vllm"
+> ```
+>
+> Set both variables: without the commit, the build silently uses nightly binaries.
+
 🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
 For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
@@ -63,7 +79,7 @@ Find the full list of supported models [here](https://docs.vllm.ai/en/latest/mod
 
 ## Getting Started
 
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+Install upstream vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip` (for this fork, see the note at the top):
 
 ```bash
 uv pip install vllm
